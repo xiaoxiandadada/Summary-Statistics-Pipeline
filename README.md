@@ -82,6 +82,6 @@ Rscript run_pipeline.R --mode correl   --zscore zscore.txt   --panel g1000_eur/g
 ## 输出说明
 
 - Selection：`results/selection/<info>_<pheno>_selection.csv`
-  - 列包含 `id, rsid, chr, pos, pval.orginal, pval.knockoff*, W, Qvalue, selected, geno_source`。
+  - 列包含 `id, pval.orginal, pval.knockoff*, W, Qvalue, selected, nearest_gene`（其余元信息在 chunk summary 中保留）。
   - 若按 LD blocks 切块（`--ld_coord`），会额外生成 `<prefix>_chunk_summary.csv` 与 `<prefix>_chunks/`，记录每个分块的范围、来源（ld_block/fallback）及选择数。示例输出保存在 `results_panel/zscore_Z_chunks_GRCH37|GRCH38` 与 `results_geno/zscore_Z_chunks_GRCH37|GRCH38` 目录中。
 - Correlation：`results/correlation/<info>_<pheno1>__<pheno2>_bivariate.csv` 及 `_significant_windows.csv`。

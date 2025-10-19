@@ -377,6 +377,117 @@ load_ld_blocks <- function(build, base_dir = '.') {
   blocks
 }
 
+load_gene_catalog <- function(coord, base_dir = '.') {
+  key <- toupper(trimws(coord))
+  file_map <- c(
+    GRCH37 = 'coding.genes.TSS.hg19.tsv',
+    GRCH38 = 'coding.genes.hg38.tsv'
+  )
+  if (!key %in% names(file_map)) {
+    stop('未知的坐标版本: ', coord, '。gene catalog 仅支持 GRCh37/GRCh38')
+  }
+  candidate <- file_map[[key]]
+  paths <- c(candidate, file.path(base_dir, candidate))
+  path <- paths[file.exists(paths)][1]
+  if (is.na(path)) {
+    stop('找不到 gene catalog 文件: ', candidate)
+  }
+  genes <- data.table::fread(path, data.table = FALSE)
+  colnames(genes) <- tolower(colnames(genes))
+  required_cols <- c('id', 'chr', 'start', 'end')
+  missing_cols <- setdiff(required_cols, colnames(genes))
+  if (length(missing_cols) > 0) {
+    stop('gene catalog 缺少列: ', paste(missing_cols, collapse = ', '))
+  }
+  genes$chr <- gsub('^chr', '', genes$chr, ignore.case = TRUE)
+  genes$chr <- suppressWarnings(as.integer(genes$chr))
+  genes$start <- suppressWarnings(as.numeric(genes$start))
+  genes$end <- suppressWarnings(as.numeric(genes$end))
+  genes <- genes[!is.na(genes$chr) & !is.na(genes$start) & !is.na(genes$end), , drop = FALSE]
+  genes <- genes[order(genes$chr, genes$start, genes$end), , drop = FALSE]
+  genes
+}
+
+nearest_gene_annotation <- function(chrs, positions, gene_catalog) {
+  if (is.null(gene_catalog) || nrow(gene_catalog) == 0) {
+    return(rep(NA_character_, length(positions)))
+  }
+  chrs <- as.integer(chrs)
+  positions <- as.numeric(positions)
+  res <- rep(NA_character_, length(positions))
+  vals <- seq_along(positions)
+  valid <- !is.na(chrs) & !is.na(positions)
+  if (!any(valid)) return(res)
+  for (chr_val in sort(unique(chrs[valid]))) {
+    idx_var <- vals[valid & chrs == chr_val]
+    if (length(idx_var) == 0) next
+    genes_chr <- gene_catalog[gene_catalog$chr == chr_val, , drop = FALSE]
+    if (nrow(genes_chr) == 0) {
+      res[idx_var] <- NA_character_
+      next
+    }
+    starts <- genes_chr$start
+    ends <- genes_chr$end
+    ids <- genes_chr$id
+    pos_vec <- positions[idx_var]
+    interval_idx <- findInterval(pos_vec, starts)
+    prev_idx <- pmax(interval_idx, 1L)
+    next_idx <- pmin(interval_idx + 1L, nrow(genes_chr))
+    # distance to previous gene
+    prev_start <- starts[prev_idx]
+    prev_end <- ends[prev_idx]
+    dist_prev <- ifelse(pos_vec >= prev_start & pos_vec <= prev_end, 0,
+                        pmin(abs(pos_vec - prev_start), abs(pos_vec - prev_end)))
+    # distance to next gene
+    next_start <- starts[next_idx]
+    next_end <- ends[next_idx]
+    dist_next <- ifelse(pos_vec >= next_start & pos_vec <= next_end, 0,
+                        pmin(abs(pos_vec - next_start), abs(pos_vec - next_end)))
+    choose_prev <- dist_prev <= dist_next
+    chosen_ids <- ifelse(choose_prev, ids[prev_idx], ids[next_idx])
+    res[idx_var] <- chosen_ids
+  }
+  res
+}
+
+plot_manhattan_w <- function(df, out_path, title = 'Manhattan plot (W statistic)') {
+  df <- df[!is.na(df$chr) & !is.na(df$pos) & !is.na(df$W), , drop = FALSE]
+  if (nrow(df) == 0) return(invisible())
+  df <- df[order(df$chr, df$pos), , drop = FALSE]
+  df$logp <- abs(df$W)
+  chr_levels <- sort(unique(df$chr))
+  colors <- c('#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b')
+  highlight_color <- '#e41a1c'
+  df$color <- colors[(match(df$chr, chr_levels) - 1) %% length(colors) + 1]
+  offsets <- numeric(length(chr_levels))
+  names(offsets) <- chr_levels
+  cumulative <- 0
+  tick_pos <- numeric(length(chr_levels))
+  for (i in seq_along(chr_levels)) {
+    chr <- chr_levels[i]
+    chr_rows <- which(df$chr == chr)
+    offsets[i] <- cumulative
+    df$cum_pos[chr_rows] <- df$pos[chr_rows] + cumulative
+    tick_pos[i] <- cumulative + stats::median(df$pos[chr_rows])
+    cumulative <- cumulative + max(df$pos[chr_rows])
+  }
+  png(out_path, width = 1600, height = 600)
+  old_par <- par(no.readonly = TRUE)
+  on.exit({par(old_par); dev.off()}, add = TRUE)
+  par(mar = c(5, 5, 3, 1))
+  plot(df$cum_pos, df$logp, col = df$color, pch = 16, cex = 0.7,
+       xaxt = 'n', xlab = 'Chromosome', ylab = 'W statistic', main = title,
+       cex.axis = 1.2, cex.lab = 1.4, cex.main = 1.6, las = 1, font.main = 2, font.lab = 2)
+  if (any(df$selected, na.rm = TRUE)) {
+    points(df$cum_pos[df$selected], df$logp[df$selected], col = highlight_color, pch = 16, cex = 0.9)
+  }
+  axis(1, at = tick_pos, labels = chr_levels, cex.axis = 1.2)
+  grid(nx = NA, ny = NULL, col = '#dddddd', lty = 3)
+  legend('topright', legend = c('Variants', 'Selected'), col = c(colors[1], highlight_color),
+         pch = 16, cex = 1.0, bty = 'n')
+  invisible()
+}
+
 load_genotype_rds <- function(path) {
   obj <- readRDS(path)
   if (!is.matrix(obj)) stop('RDS未包含matrix对象')
@@ -1025,6 +1136,7 @@ execute_pipeline <- function(opts) {
   dir.create(opts$outdir, showWarnings = FALSE, recursive = TRUE)
 
   ld_blocks <- load_ld_blocks(opts$ld_coord)
+  gene_catalog <- load_gene_catalog(opts$ld_coord)
 
   info <- load_variant_info(opts$info)
   if (is.null(info) || nrow(info) == 0) stop('变异信息文件读取失败或为空')
@@ -1183,6 +1295,20 @@ execute_pipeline <- function(opts) {
     selection_table$pos <- suppressWarnings(as.integer(gsub('[^0-9]', '', pos_raw)))
     selection_table$geno_source <- geno_source_type
 
+    if (!is.null(gene_catalog) && nrow(gene_catalog) > 0) {
+      selection_table$nearest_gene <- nearest_gene_annotation(selection_table$chr, selection_table$pos, gene_catalog)
+    } else {
+      selection_table$nearest_gene <- NA_character_
+    }
+
+    plot_df <- selection_table[, c('id', 'chr', 'pos', 'W', 'selected')]
+    drop_cols <- intersect(c('chunk_id', 'chunk_chr', 'chunk_start', 'chunk_end', 'chunk_size_bp',
+                             'partition_source', 'rsid', 'chr', 'pos', 'geno_source'), colnames(selection_table))
+    final_table <- selection_table
+    if (length(drop_cols) > 0) {
+      final_table <- final_table[, setdiff(colnames(final_table), drop_cols), drop = FALSE]
+    }
+
     out_dir <- file.path(opts$outdir, 'selection')
     dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
     old_files <- list.files(out_dir, full.names = TRUE)
@@ -1196,7 +1322,7 @@ execute_pipeline <- function(opts) {
     prefix <- paste0(prefix_base, '_', gsub('[^A-Za-z0-9_]+', '_', attr(gwas_data, 'pheno1_name')))
 
     out_csv <- file.path(out_dir, paste0(prefix, '_selection.csv'))
-    readr::write_csv(selection_table, out_csv)
+    readr::write_csv(final_table, out_csv)
 
     summary_df <- data.frame(
       phenotype = attr(gwas_data, 'pheno1_name'),
@@ -1229,6 +1355,9 @@ execute_pipeline <- function(opts) {
         }
       }
     }
+
+    manhattan_path <- file.path(out_dir, paste0(prefix, '_manhattan.png'))
+    plot_manhattan_w(plot_df, manhattan_path, title = paste0(prefix_base, ' (', attr(gwas_data, 'pheno1_name'), ')'))
 
     if (opts$verbose) cat(sprintf('已保存结果: %s\n', out_csv))
 

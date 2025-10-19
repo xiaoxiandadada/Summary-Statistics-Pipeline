@@ -151,6 +151,7 @@ main <- function() {
     "optparse",
     # stats / methods used by pipeline
     "SKAT", "SPAtest", "CompQuadForm", "irlba", "matrixsampling",
+    "qqman",
     # knockoff components
     "GhostKnockoff",
     # optional acceleration
