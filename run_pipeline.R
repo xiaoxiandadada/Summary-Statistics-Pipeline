@@ -36,6 +36,8 @@ opt_list <- list(
               help = '窗口大小(bp) (correl模式)', metavar = 'INT'),
   make_option(c('--step'), type = 'integer', default = 50000,
               help = '窗口步长(bp) (correl模式)', metavar = 'INT'),
+  make_option(c('--threads'), type = 'integer', default = NULL,
+              help = 'Python 侧分块时的线程数 (默认自动)', metavar = 'INT'),
   make_option(c('--pheno1_name'), type = 'character', default = 'trait1',
               help = '表型1名称（用于日志/输出命名）', metavar = 'STR'),
   make_option(c('--pheno2_name'), type = 'character', default = 'trait2',
@@ -58,14 +60,18 @@ opt_list <- list(
               help = '在 zscore 文件中选择的trait列名，逗号分隔 (最多取前两个)', metavar = 'STR'),
   make_option(c('--geno_format'), type = 'character', default = 'samples_by_snps',
               help = '基因型CSV格式: samples_by_snps 或 snps_by_samples', metavar = 'STR'),
-  make_option(c('--py_accel'), action = 'store_true', default = FALSE,
-              help = '启用Python加速（需reticulate与依赖环境）'),
   make_option(c('-v', '--verbose'), action = 'store_true', default = FALSE,
               help = '打印详细日志')
 )
 
 parser <- OptionParser(option_list = opt_list)
 opts <- parse_args(parser)
+
+if (is.null(opts$threads) || is.na(opts$threads) || opts$threads <= 0) {
+  detected_threads <- tryCatch(parallel::detectCores(logical = TRUE), error = function(...) NA_integer_)
+  if (is.na(detected_threads) || detected_threads < 1L) detected_threads <- 1L
+  opts$threads <- detected_threads
+}
 
 execution <- execute_pipeline(opts)
 

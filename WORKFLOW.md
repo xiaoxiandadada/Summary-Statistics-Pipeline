@@ -20,7 +20,7 @@
    - 计算收缩 LD（`corpcor::cor.shrink`）并生成 M 个 knockoff Z 分数
 
 3) 模式分流
-   - select：将原始与 knockoff Z 转为双侧 p 值，调用 `LAVAKnock()` 做 FDR 控制；无论使用真实基因型还是参考面板，均依据 `--ld_coord` 指定的 LD block 坐标逐块执行 GhostKnockoff，输出 block summary（必要时自动 fallback 到染色体范围）
+   - select：将原始与 knockoff Z 转为双侧 p 值，调用 `LAVAKnock()` 做 FDR 控制；无论使用真实基因型还是参考面板，均通过 `accelerator.py` 的 `partition_ld_blocks()` 调用 Python 线程池（默认使用全部 CPU，可用 `--threads` 调整）读取 LD 坐标并切块，再逐块执行 GhostKnockoff，必要时自动 fallback 到染色体范围
    - correl：按窗口切片，调用 `LAVAKnock_bivariate()` 计算窗口双表型局部相关性，再用 `LAVAKnock()` 做窗口级 FDR 过滤
 
 4) 输出
@@ -29,11 +29,9 @@
    - correl：`results/correlation/<info>_bivariate.csv` 与 `<info>_significant_windows.csv`（如有显著窗口）
 
 ## Python 加速接入
-- Python 加速：`accelerator.py`（可选）
-  - R 侧通过 `reticulate::source_python('accelerator.py')` 载入
-  - 主要函数：`fast_correlation_matrix`、`ld_pruning` 等（R 侧封装为 `py_fast_correlation`/`py_ld_pruning` 回退到 R 实现）
-
-在 `summary_pipeline.R` 的 `generate_ghostknockoff_scores()` 中，通过 `use_python_accel` 参数控制是否使用 Python 加速的相关系数与 LD 修剪。
+- Python 加速：`accelerator.py`
+  - R 侧通过 `reticulate::source_python('accelerator.py')` 载入，默认使用 NumPy/Numba 执行相关矩阵与 LD 切块
+  - 核心函数：`fast_correlation_matrix`、`ld_pruning`、`partition_ld_blocks`、`load_genotype_plink`、`load_variant_info` 等
 
 ## 脚本入口（单入口 + 可选加速）
 - `run_pipeline.R`
@@ -42,7 +40,8 @@
   - `--geno_rds`、`--geno_csv`、`--geno_plink` 输入真实基因型；`--geno_format` 描述 CSV 方向
   - `--ref_plink` 指定参考面板前缀（默认 `g1000_eur/g1000_eur`），仅在缺少真实基因型时使用
   - `--ld_coord` 控制 selection 模式下使用的 LD block 坐标（须指定 `GRCh37` 或 `GRCh38`）
-  - 其他参数：`--n`、`--win`、`--step`、`-k`、`--fdr`、`-v`、`--py_accel` 等
+  - `--threads` 控制 Python 分块线程数（默认自动）；当内存/带宽有限时可调低
+  - 其他参数：`--n`、`--win`、`--step`、`-k`、`--fdr`、`-v` 等
 
 ## 清理脚本
 - `scripts/clean_workspace.R`：清理临时与过程文件（默认预览，使用 `-y` 执行）

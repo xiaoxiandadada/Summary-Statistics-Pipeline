@@ -15,12 +15,22 @@ Provided capabilities:
 - parallel_window_analysis: parallel per-window processing (optional)
 """
 
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Sequence
+import os
+import csv
+import warnings
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import numpy as np
 except Exception as e:  # pragma: no cover
     np = None
+
+try:  # pragma: no cover
+    import pandas as pd
+except Exception:
+    pd = None
 
 # Try optional numba JIT; fallback to numpy implementation if unavailable.
 try:  # pragma: no cover
@@ -109,6 +119,604 @@ def available() -> bool:
     return np is not None
 
 
+# ----------------------------
+# Helpers for pandas-based preprocessing
+# ----------------------------
+
+def _require_pandas():
+    if pd is None:
+        raise RuntimeError("pandas is required for Python-side preprocessing")
+
+
+def _canon_chr(series):
+    _require_pandas()
+    s = series.astype(str).str.upper().str.replace('^CHR', '', regex=True)
+    s = s.replace({'X': '23', 'Y': '24', 'M': '25', 'MT': '25', 'MITO': '25'})
+    return pd.to_numeric(s, errors='coerce')
+
+
+def _canon_pos(series):
+    _require_pandas()
+    return pd.to_numeric(series, errors='coerce')
+
+
+def _read_table_auto(path):
+    _require_pandas()
+    return pd.read_csv(path, sep=None, engine='python')
+
+
+# ----------------------------
+# LD block partitioning helpers
+# ----------------------------
+
+BLOCK_FILES = {
+    "GRCH37": "LAVA_s2500_m25_f1_w200.blocks",
+    "GRCH38": "deCODE_EUR_LD_blocks.bed"
+}
+
+GENE_FILES = {
+    "GRCH37": "coding.genes.TSS.hg19.tsv",
+    "GRCH38": "coding.genes.hg38.tsv"
+}
+
+
+def _resolve_block_path(coord_version: str, base_dir: str = ".") -> str:
+    candidate = coord_version.strip()
+    if os.path.isfile(candidate):
+        return os.path.abspath(candidate)
+    key = candidate.upper()
+    if key in BLOCK_FILES:
+        filename = BLOCK_FILES[key]
+        candidate_paths = [filename, os.path.join(base_dir, filename)]
+        path = next((p for p in candidate_paths if os.path.exists(p)), None)
+        if path is None:
+            raise FileNotFoundError(f"Cannot locate LD block file: {filename}")
+        return os.path.abspath(path)
+    raise FileNotFoundError(f"Unsupported coord version or path: {coord_version}")
+
+
+@lru_cache(maxsize=16)
+def _load_ld_blocks_cached(path: str) -> Dict[int, List[Tuple[float, float]]]:
+    per_chr: Dict[int, List[Tuple[float, float]]] = {}
+    with open(path, "r", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            chr_val = row.get("chr") or row.get("CHR") or row.get("chrom")
+            if chr_val is None:
+                continue
+            chr_val = chr_val.strip()
+            if chr_val.lower().startswith("chr"):
+                chr_val = chr_val[3:]
+            try:
+                chr_int = int(chr_val)
+            except ValueError:
+                continue
+            start = row.get("start") or row.get("Start")
+            end = row.get("stop") or row.get("end") or row.get("Stop")
+            if start is None or end is None:
+                continue
+            try:
+                start_f = float(start)
+                end_f = float(end)
+            except ValueError:
+                continue
+            per_chr.setdefault(chr_int, []).append((min(start_f, end_f), max(start_f, end_f)))
+    return per_chr
+
+
+def partition_ld_blocks(
+    chromosomes: List[int],
+    positions: List[float],
+    coord_version: str,
+    fallback: bool = True,
+    workers: Optional[int] = None,
+    base_dir: str = "."
+) -> Dict[str, List[Dict[str, object]]]:
+    if np is None:
+        raise RuntimeError("numpy is required for partition_ld_blocks")
+    block_path = _resolve_block_path(coord_version, base_dir)
+    blocks = _load_ld_blocks_cached(block_path)
+    chrom_arr = np.asarray(chromosomes, dtype=np.int64)
+    pos_arr = np.asarray(positions, dtype=np.float64)
+    valid_mask = np.isfinite(chrom_arr) & np.isfinite(pos_arr)
+    valid_indices = np.nonzero(valid_mask)[0]
+    if valid_indices.size == 0:
+        return {"chunks": [], "fallback": []}
+    chrom_arr = chrom_arr[valid_indices]
+    pos_arr = pos_arr[valid_indices]
+    orig_idx = valid_indices
+    unique_chr = np.unique(chrom_arr)
+    max_workers = workers or min(len(unique_chr), os.cpu_count() or 1)
+
+    def process_chr(chr_val: int):
+        chr_mask = chrom_arr == chr_val
+        chr_indices = orig_idx[chr_mask]
+        chr_positions = pos_arr[chr_mask]
+        if chr_indices.size == 0:
+            return [], []
+        assigned = np.zeros(chr_indices.shape[0], dtype=bool)
+        chunk_list: List[Dict[str, object]] = []
+        fallback_list: List[Dict[str, object]] = []
+        chr_blocks = blocks.get(int(chr_val), [])
+        for block_start, block_end in chr_blocks:
+            block_mask = (chr_positions >= block_start) & (chr_positions <= block_end)
+            if int(block_mask.sum()) < 5:
+                continue
+            block_indices = chr_indices[block_mask].tolist()
+            chunk_list.append({
+                "chr": int(chr_val),
+                "start": float(block_start),
+                "end": float(block_end),
+                "indices": block_indices,
+                "source": "ld_block"
+            })
+            assigned |= block_mask
+        if fallback:
+            leftover_mask = ~assigned
+            if int(leftover_mask.sum()) >= 5:
+                leftover_indices = chr_indices[leftover_mask].tolist()
+                leftover_positions = chr_positions[leftover_mask]
+                fallback_list.append({
+                    "chr": int(chr_val),
+                    "start": float(np.min(leftover_positions)),
+                    "end": float(np.max(leftover_positions)),
+                    "indices": leftover_indices,
+                    "source": "fallback"
+                })
+        return chunk_list, fallback_list
+
+    results_chunks: List[Dict[str, object]] = []
+    results_fallback: List[Dict[str, object]] = []
+    with ThreadPoolExecutor(max_workers=max_workers or 1) as executor:
+        for chunk_list, fallback_list in executor.map(process_chr, unique_chr.tolist()):
+            if chunk_list:
+                results_chunks.extend(chunk_list)
+            if fallback_list:
+                results_fallback.extend(fallback_list)
+    return {"chunks": results_chunks, "fallback": results_fallback}
+
+
+# ----------------------------
+# Genotype loaders (R wraps these via reticulate)
+# ----------------------------
+
+_GENO_LUT = None
+
+
+def _build_geno_lut():
+    global _GENO_LUT
+    if _GENO_LUT is not None:
+        return _GENO_LUT
+    lut = np.empty((256, 4), dtype=np.float64)
+    lut.fill(np.nan)
+    for byte_val in range(256):
+        for shift in range(4):
+            code = (byte_val >> (2 * shift)) & 0b11
+            if code == 0:
+                lut[byte_val, shift] = 0.0
+            elif code == 1:
+                lut[byte_val, shift] = np.nan  # missing
+            elif code == 2:
+                lut[byte_val, shift] = 1.0
+            else:
+                lut[byte_val, shift] = 2.0
+    _GENO_LUT = lut
+    return lut
+
+
+def _read_plink_bed(path: str, n_samples: int, n_snps: int) -> "np.ndarray":
+    lut = _build_geno_lut()
+    with open(path, "rb") as handle:
+        header = handle.read(3)
+        if len(header) != 3 or header[0] != 0x6C or header[1] != 0x1B:
+            raise ValueError("Invalid PLINK .bed header (magic bytes mismatch)")
+        if header[2] != 0x01:
+            raise ValueError("PLINK .bed must be in SNP-major mode (header byte != 1)")
+        bytes_per_snp = (n_samples + 3) // 4
+        payload = np.fromfile(handle, dtype=np.uint8)
+    expected = n_snps * bytes_per_snp
+    if payload.size != expected:
+        raise ValueError(f"Unexpected .bed payload size (expected {expected}, got {payload.size})")
+    shaped = payload.reshape((n_snps, bytes_per_snp))
+    decoded = lut[shaped].reshape(n_snps, -1)[:, :n_samples]
+    return decoded.T.copy()
+
+
+def load_genotype_rds(path: str):  # pragma: no cover (handled in R)
+    raise NotImplementedError("RDS genotype loading is handled in R (requires R serialization)")
+
+
+def load_genotype_csv(path: str, fmt: str = "samples_by_snps") -> "np.ndarray":
+    if np is None:
+        raise RuntimeError("numpy is required for load_genotype_csv")
+    import pandas as pd
+    df = pd.read_csv(path)
+    mat = df.to_numpy(dtype=float)
+    if fmt == "snps_by_samples":
+        mat = mat.T
+    return mat
+
+
+def load_genotype_plink(path_prefix: str, snp_ids=None, chrpos_ids=None):
+    if np is None or pd is None:
+        raise RuntimeError("numpy and pandas are required for load_genotype_plink")
+
+    bed_path = f"{path_prefix}.bed"
+    bim_path = f"{path_prefix}.bim"
+    fam_path = f"{path_prefix}.fam"
+    for file_path in (bed_path, bim_path, fam_path):
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Missing PLINK file: {file_path}")
+
+    bim_cols = ['CHR', 'RSID', 'CM', 'POS', 'A1', 'A2']
+    bim_df = pd.read_csv(bim_path, sep=r'\s+', names=bim_cols)
+    bim_df['CHR'] = _canon_chr(bim_df['CHR'])
+    bim_df['POS'] = _canon_pos(bim_df['POS'])
+    bim_df['CHRPOS'] = bim_df['CHR'].astype('Int64').astype(str) + ':' + bim_df['POS'].astype('Int64').astype(str)
+
+    fam_df = pd.read_csv(fam_path, sep=r'\s+', header=None)
+    n_samples = fam_df.shape[0]
+    n_snps_total = bim_df.shape[0]
+
+    select_mask = np.zeros(n_snps_total, dtype=bool)
+    rsid_series = bim_df['RSID'].fillna('')
+    chrpos_series = bim_df['CHRPOS']
+
+    messages: List[str] = []
+
+    if snp_ids:
+        snp_list = [s for s in snp_ids if isinstance(s, str) and len(s) > 0]
+        if snp_list:
+            snp_set = set(snp_list)
+            matched = rsid_series.isin(snp_set).to_numpy()
+            select_mask |= matched
+            missing_rsids = list(snp_set - set(rsid_series[matched]))
+            if missing_rsids:
+                messages.append("rsid missing: " + ", ".join(missing_rsids[:10]))
+
+    if chrpos_ids:
+        chrpos_list = [s for s in chrpos_ids if isinstance(s, str) and len(s) > 0]
+        if chrpos_list:
+            chrpos_set = set(chrpos_list)
+            matched = chrpos_series.isin(chrpos_set).to_numpy()
+            select_mask |= matched
+            missing_chrpos = list(chrpos_set - set(chrpos_series[matched]))
+            if missing_chrpos:
+                messages.append("chr:pos missing: " + ", ".join(missing_chrpos[:10]))
+
+    if not select_mask.any():
+        select_mask = np.ones(n_snps_total, dtype=bool)
+
+    selected_idx = np.where(select_mask)[0]
+    if selected_idx.size == 0:
+        raise ValueError("No variants selected from PLINK files")
+
+    genotype_matrix = _read_plink_bed(bed_path, n_samples, n_snps_total)[:, selected_idx]
+
+    col_means = np.nanmean(genotype_matrix, axis=0)
+    nan_r, nan_c = np.where(np.isnan(genotype_matrix))
+    if nan_r.size:
+        genotype_matrix[nan_r, nan_c] = col_means[nan_c]
+    genotype_matrix = np.nan_to_num(genotype_matrix, nan=0.0)
+
+    selected_bim = bim_df.iloc[selected_idx].reset_index(drop=True)
+    rsid_out = selected_bim['RSID'].fillna('').tolist()
+    chrpos_out = selected_bim['CHRPOS'].tolist()
+
+    colnames = []
+    for rsid_value, chrpos_value in zip(rsid_out, chrpos_out):
+        if rsid_value:
+            colnames.append(rsid_value)
+        else:
+            colnames.append(chrpos_value)
+
+    if messages:
+        warnings.warn("; ".join(messages))
+
+    return {
+        "matrix": genotype_matrix,
+        "map": selected_bim[['CHR', 'RSID', 'POS', 'A1', 'A2']],
+        "colnames": colnames,
+        "chrpos": chrpos_out,
+        "rsid": rsid_out
+    }
+
+
+# ----------------------------
+# Variant / GWAS preparation
+# ----------------------------
+
+def load_variant_info(path: str):
+    _require_pandas()
+    df = pd.read_csv(path)
+    if df.empty:
+        return df
+    lower = {c.lower(): c for c in df.columns}
+    chr_col = next((lower[key] for key in ['chr', 'chrom', 'chromosome'] if key in lower), None)
+    pos_col = next((lower[key] for key in ['pos_bp', 'pos', 'position', 'bp'] if key in lower), None)
+    if chr_col is None or pos_col is None:
+        raise ValueError('variant info must contain chr and position columns')
+    df['chr'] = _canon_chr(df[chr_col])
+    df['pos_bp'] = _canon_pos(df[pos_col])
+    if 'rsid' not in df.columns:
+        df['rsid'] = 'chr' + df['chr'].astype('Int64').astype(str) + ':' + df['pos_bp'].astype('Int64').astype(str)
+    out = df[['rsid', 'chr', 'pos_bp']].dropna().drop_duplicates().sort_values(['chr', 'pos_bp'])
+    return out.reset_index(drop=True)
+
+
+def _detect_traits(df: "pd.DataFrame", trait_cols) -> List[str]:
+    exclude = {'CHR', 'POS', 'CM', 'A1', 'A2', 'BP', 'N', 'SE', 'P', 'BETA'}
+    numeric_cols = []
+    for col in df.columns:
+        if col.upper() in exclude:
+            continue
+        numeric = pd.to_numeric(df[col], errors='coerce')
+        if numeric.notna().any():
+            df[col] = numeric
+            numeric_cols.append(col)
+    if trait_cols:
+        selected = [c for c in trait_cols if c in numeric_cols]
+    else:
+        selected = numeric_cols
+    return selected[:2]
+
+
+def auto_prepare_inputs(zscore_path: str, panel_prefix: str, trait_cols=None, verbose: bool = False) -> Dict[str, object]:
+    _require_pandas()
+    z_df = pd.read_csv(zscore_path, sep=None, engine='python')
+    if 'CHR' not in z_df.columns or 'POS' not in z_df.columns:
+        if 'RSID' in z_df.columns:
+            split = z_df['RSID'].astype(str).str.split(':', expand=True)
+            if split.shape[1] >= 2:
+                z_df['CHR'] = split[0]
+                z_df['POS'] = split[1]
+    if 'CHR' not in z_df.columns or 'POS' not in z_df.columns:
+        raise ValueError('zscore file must contain CHR and POS columns or rsid formatted as chr:pos')
+    z_df['CHR'] = _canon_chr(z_df['CHR'])
+    z_df['POS'] = _canon_pos(z_df['POS'])
+    z_df = z_df.dropna(subset=['CHR', 'POS'])
+
+    bim_path = f"{panel_prefix}.bim"
+    bim_cols = ['CHR', 'RSID', 'CM', 'POS', 'A1', 'A2']
+    bim_df = pd.read_csv(bim_path, sep='\s+', names=bim_cols)
+    bim_df['CHR'] = _canon_chr(bim_df['CHR'])
+    bim_df['POS'] = _canon_pos(bim_df['POS'])
+
+    merged = pd.merge(bim_df, z_df, on=['CHR', 'POS'])
+    if merged.empty:
+        raise ValueError('No overlap between zscore and reference BIM on CHR+POS')
+
+    traits = _detect_traits(merged, trait_cols)
+    if not traits:
+        raise ValueError('No numeric trait columns detected in zscore file')
+
+    info_df = merged[['RSID', 'CHR', 'POS']].drop_duplicates().rename(columns={'POS': 'pos_bp'})
+    info_df = info_df.sort_values(['CHR', 'pos_bp']).reset_index(drop=True)
+
+    gwas_tables = []
+    for trait in traits:
+        trait_df = merged[['CHR', 'POS', trait]].rename(columns={trait: 'Z'})
+        trait_df = trait_df.dropna(subset=['Z']).reset_index(drop=True)
+        gwas_tables.append(trait_df)
+
+    if verbose:
+        print(f"auto_prepare_inputs: matched {info_df.shape[0]} variants; traits = {traits}")
+
+    return {
+        'variant_info': info_df,
+        'traits': traits,
+        'gwas_tables': gwas_tables
+    }
+
+
+def load_gwas_table(gwas_file: str) -> "pd.DataFrame":
+    _require_pandas()
+    df = pd.read_csv(gwas_file, sep=None, engine='python')
+    if 'CHR' not in df.columns or 'POS' not in df.columns:
+        raise ValueError('GWAS file must contain CHR and POS columns')
+    df['CHR'] = _canon_chr(df['CHR'])
+    df['POS'] = _canon_pos(df['POS'])
+    z_col = next((c for c in df.columns if c.upper() == 'Z'), None)
+    if z_col is None:
+        raise ValueError('GWAS file must contain Z column')
+    df['Z'] = pd.to_numeric(df[z_col], errors='coerce')
+    df = df.dropna(subset=['CHR', 'POS', 'Z']).drop_duplicates(subset=['CHR', 'POS'])
+    return df[['CHR', 'POS', 'Z']].reset_index(drop=True)
+
+
+def load_multi_gwas_table(multi_file: str, zcols: str) -> Dict[str, object]:
+    _require_pandas()
+    df = pd.read_csv(multi_file, sep=None, engine='python')
+    if 'CHR' not in df.columns or 'POS' not in df.columns:
+        raise ValueError('multi_gwas file must contain CHR and POS columns')
+    df['CHR'] = _canon_chr(df['CHR'])
+    df['POS'] = _canon_pos(df['POS'])
+    df = df.dropna(subset=['CHR', 'POS']).drop_duplicates(subset=['CHR', 'POS'])
+    user_cols = [c.strip() for c in zcols.split(',') if c.strip()]
+    for col in user_cols:
+        if col not in df.columns:
+            raise ValueError(f"z column '{col}' not found in multi_gwas file")
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    return {
+        'data': df,
+        'zcols': user_cols
+    }
+
+
+def load_gene_catalog(coord_version: str, base_dir: str = "."):
+    _require_pandas()
+    candidate = coord_version.strip()
+    if os.path.isfile(candidate):
+        path = os.path.abspath(candidate)
+    else:
+        key = candidate.upper()
+        if key not in GENE_FILES:
+            raise FileNotFoundError(f"Unsupported gene catalog key or path: {coord_version}")
+        filename = GENE_FILES[key]
+        search_paths = [filename, os.path.join(base_dir, filename)]
+        path = next((os.path.abspath(p) for p in search_paths if os.path.exists(p)), None)
+        if path is None:
+            raise FileNotFoundError(f"Cannot locate gene catalog file: {filename}")
+    df = pd.read_csv(path, sep=None, engine='python')
+    lower = {c.lower(): c for c in df.columns}
+    required = ['id', 'chr', 'start', 'end']
+    missing = [col for col in required if col not in lower]
+    if missing:
+        raise ValueError(f"gene catalog missing required columns: {missing}")
+    df = df.rename(columns={lower['id']: 'id', lower['chr']: 'chr',
+                            lower['start']: 'start', lower['end']: 'end'})
+    df['chr'] = df['chr'].astype(str).str.replace('^chr', '', regex=True, case=False)
+    df['chr'] = pd.to_numeric(df['chr'], errors='coerce')
+    df['start'] = pd.to_numeric(df['start'], errors='coerce')
+    df['end'] = pd.to_numeric(df['end'], errors='coerce')
+    df = df.dropna(subset=['id', 'chr', 'start', 'end'])
+    df = df.sort_values(['chr', 'start', 'end']).reset_index(drop=True)
+    return df[['id', 'chr', 'start', 'end']]
+
+
+def annotate_nearest_gene(chromosomes, positions, gene_table):
+    _require_pandas()
+    import pandas as pd
+    chrom_series = pd.to_numeric(pd.Series(chromosomes), errors='coerce')
+    pos_series = pd.to_numeric(pd.Series(positions), errors='coerce')
+    genes = gene_table.copy()
+    if not isinstance(genes, pd.DataFrame):
+        genes = pd.DataFrame(genes)
+    required = {'id', 'chr', 'start', 'end'}
+    if not required.issubset(set(genes.columns)):
+        raise ValueError("gene_table must contain columns id, chr, start, end")
+    genes = genes.copy()
+    genes['chr'] = pd.to_numeric(genes['chr'], errors='coerce')
+    genes['start'] = pd.to_numeric(genes['start'], errors='coerce')
+    genes['end'] = pd.to_numeric(genes['end'], errors='coerce')
+    genes = genes.dropna(subset=['chr', 'start', 'end'])
+    genes = genes.sort_values(['chr', 'start', 'end'])
+
+    results: List[Optional[str]] = [None] * len(pos_series)
+    valid_mask = chrom_series.notna() & pos_series.notna()
+    if not valid_mask.any():
+        return results
+
+    for chr_val in sorted(chrom_series[valid_mask].unique()):
+        chr_mask = (chrom_series == chr_val) & valid_mask
+        idx = np.where(chr_mask.to_numpy())[0]
+        if idx.size == 0:
+            continue
+        genes_chr = genes[genes['chr'] == chr_val]
+        if genes_chr.empty:
+            continue
+        starts = genes_chr['start'].to_numpy()
+        ends = genes_chr['end'].to_numpy()
+        ids = genes_chr['id'].astype(str).to_numpy()
+        pos_vals = pos_series.iloc[idx].to_numpy()
+        insert_idx = np.searchsorted(starts, pos_vals)
+        prev_idx = np.clip(insert_idx - 1, 0, len(starts) - 1)
+        next_idx = np.clip(insert_idx, 0, len(starts) - 1)
+        dist_prev = np.where((pos_vals >= starts[prev_idx]) & (pos_vals <= ends[prev_idx]),
+                             0,
+                             np.minimum(np.abs(pos_vals - starts[prev_idx]), np.abs(pos_vals - ends[prev_idx])))
+        dist_next = np.where((pos_vals >= starts[next_idx]) & (pos_vals <= ends[next_idx]),
+                             0,
+                             np.minimum(np.abs(pos_vals - starts[next_idx]), np.abs(pos_vals - ends[next_idx])))
+        use_prev = dist_prev <= dist_next
+        nearest = np.where(use_prev, ids[prev_idx], ids[next_idx])
+        for arr_idx, gene_id in zip(idx, nearest):
+            results[arr_idx] = gene_id
+    return results
+
+
+def align_genotype_to_gwas(geno_matrix,
+                           geno_colnames,
+                           geno_chrpos,
+                           geno_rsid,
+                           gwas_df,
+                           prefer_rsid: bool = True):
+    _require_pandas()
+    import pandas as pd
+
+    G = np.asarray(geno_matrix, dtype=np.float64)
+    if G.ndim != 2:
+        raise ValueError("geno_matrix must be 2D")
+
+    colnames = list(geno_colnames) if geno_colnames is not None else None
+    chrpos_attr = list(geno_chrpos) if geno_chrpos is not None else None
+    rsid_attr = list(geno_rsid) if geno_rsid is not None else None
+
+    gwas = gwas_df.copy()
+    if 'chr' not in gwas.columns or 'pos_bp' not in gwas.columns:
+        raise ValueError("gwas dataframe must contain chr and pos_bp columns")
+    if 'rsid' not in gwas.columns:
+        gwas['rsid'] = pd.NA
+    gwas['chr'] = pd.to_numeric(gwas['chr'], errors='coerce')
+    gwas['pos_bp'] = pd.to_numeric(gwas['pos_bp'], errors='coerce')
+    gwas = gwas.dropna(subset=['chr', 'pos_bp'])
+    gwas['chr'] = gwas['chr'].astype(int)
+    gwas['pos_bp'] = gwas['pos_bp'].astype(int)
+    gwas['chrpos'] = gwas['chr'].astype(str) + ':' + gwas['pos_bp'].astype(str)
+
+    rsid_lookup = {}
+    if rsid_attr is not None:
+        for idx, val in enumerate(rsid_attr):
+            if isinstance(val, str) and val not in rsid_lookup:
+                rsid_lookup[val] = idx
+
+    chrpos_lookup = {}
+    if chrpos_attr is not None:
+        for idx, val in enumerate(chrpos_attr):
+            if isinstance(val, str) and val not in chrpos_lookup:
+                chrpos_lookup[val] = idx
+
+    colname_lookup = {}
+    if colnames is not None:
+        for idx, val in enumerate(colnames):
+            if isinstance(val, str) and val not in colname_lookup:
+                colname_lookup[val] = idx
+
+    selected_cols: List[int] = []
+    gwas_indices: List[int] = []
+    variant_ids: List[str] = []
+    positions: List[int] = []
+    rsid_out: List[Optional[str]] = []
+
+    for row_idx, row in enumerate(gwas.itertuples(index=False)):
+        rsid_value = row.rsid if isinstance(row.rsid, str) else None
+        chrpos_value = row.chrpos
+        col_idx = None
+
+        if prefer_rsid and rsid_value and rsid_value in rsid_lookup:
+            col_idx = rsid_lookup[rsid_value]
+
+        if col_idx is None and chrpos_value in chrpos_lookup:
+            col_idx = chrpos_lookup[chrpos_value]
+
+        if col_idx is None and colnames is not None and chrpos_value in colname_lookup:
+            col_idx = colname_lookup[chrpos_value]
+
+        if col_idx is None and not prefer_rsid and rsid_value and rsid_value in rsid_lookup:
+            col_idx = rsid_lookup[rsid_value]
+
+        if col_idx is None or col_idx in selected_cols:
+            continue
+
+        selected_cols.append(col_idx)
+        gwas_indices.append(row_idx)
+        variant_ids.append(chrpos_value)
+        positions.append(int(row.pos_bp))
+        rsid_out.append(rsid_value)
+
+    if len(selected_cols) < 2:
+        raise ValueError("Matched variants fewer than 2 between genotype matrix and GWAS data")
+
+    G_selected = G[:, selected_cols]
+
+    return {
+        "matrix": G_selected,
+        "variant_ids": variant_ids,
+        "positions": positions,
+        "gwas_indices": gwas_indices,
+        "rsid": rsid_out,
+        "matched": len(selected_cols)
+    }
 # ----------------------------
 # Additional utilities
 # ----------------------------

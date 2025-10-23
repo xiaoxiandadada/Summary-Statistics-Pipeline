@@ -1,41 +1,24 @@
 #!/usr/bin/env Rscript
 
-# =============================================================================
-# Pipeline - 主分析流程
-# =============================================================================
-# 包括GhostKnockoff生成和LAVA-Knock局部遗传相关性分析
+# Pipeline 主分析流程
+# GhostKnockoff 生成与 LAVA-Knock 局部遗传相关分析
 
-suppressPackageStartupMessages({
-  library(Matrix)
-  library(MASS)
-  library(corpcor)
-  library(parallel)
-  library(doParallel)
-  library(foreach)
-  library(data.table)
-  library(dplyr)
-  library(readr)
-  library(stringr)
-})
+# 加载基础依赖与核心 Knockoff 包
+base_libraries <- c("corpcor", "dplyr", "readr")
+suppressPackageStartupMessages(invisible(lapply(base_libraries, library, character.only = TRUE)))
 
-# 尝试加载必需的包
-required_packages <- c("SKAT", "SPAtest", "CompQuadForm", "GhostKnockoff",
-                      "irlba", "matrixsampling", "LAVAKnock", "snpStats")
-
-for (pkg in required_packages) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    stop(paste("包", pkg, "未安装。请先运行 install_packages.R"))
-  }
+required_packages <- c(
+  "SKAT", "SPAtest", "CompQuadForm", "GhostKnockoff",
+  "irlba", "matrixsampling", "LAVAKnock", "snpStats"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  stop(sprintf("缺少依赖: %s。请先运行 install_packages.R", paste(missing_packages, collapse = ", ")))
 }
 
-library(SKAT)
-library(SPAtest)
-library(CompQuadForm)
-library(GhostKnockoff)
-library(irlba)
-library(matrixsampling)
-library(LAVAKnock)
-library(snpStats)
+invisible(lapply(c("GhostKnockoff", "LAVAKnock", "snpStats"), library, character.only = TRUE))
 
 # 源配置脚本
 source("configure_parameters.R")
@@ -46,571 +29,176 @@ py_ok <- FALSE
 if (requireNamespace("reticulate", quietly = TRUE)) {
   try({ reticulate::source_python("accelerator.py", envir = py_env); py_ok <- TRUE }, silent = TRUE)
 }
+if (!isTRUE(py_ok)) {
+  stop('Python 加速模块加载失败，请确认已安装 reticulate 并能导入 accelerator.py')
+}
 
 py_fast_correlation <- function(X, verbose = FALSE) {
-  if (isTRUE(py_ok) && !is.null(py_env$fast_correlation_matrix)) {
-    return(py_env$fast_correlation_matrix(X))
-  }
-  if (verbose) message("Python accel unavailable; using R cor()")
-  return(stats::cor(X))
+  reticulate::py_to_r(py_env$fast_correlation_matrix(X))
 }
 
 py_ld_pruning <- function(corr, threshold = 0.75, verbose = FALSE) {
-  if (isTRUE(py_ok) && !is.null(py_env$ld_pruning)) {
-    idx0 <- py_env$ld_pruning(corr, threshold)
-    # convert 0-based numpy indices to 1-based R indices
-    return(as.integer(idx0) + 1L)
-  }
-  if (verbose) message("Python accel unavailable; using hclust pruning")
-  Sigma.distance <- stats::as.dist(1 - abs(corr))
-  fit <- stats::hclust(Sigma.distance, method = "single")
-  clusters <- stats::cutree(fit, h = 1 - threshold)
-  return(match(unique(clusters), clusters))
-}
-
-# =============================================================================
-# 数据加载和预处理函数
-# =============================================================================
-
-standardize_variant_info <- function(info) {
-  if (is.null(info) || nrow(info) == 0) {
-    return(info)
-  }
-  df <- as.data.frame(info, stringsAsFactors = FALSE)
-  colnames(df) <- tolower(colnames(df))
-
-  chr_col <- intersect(c('chr', 'chrom', 'chromosome'), colnames(df))
-  if (length(chr_col) == 0) {
-    stop('变异信息缺少染色体列 (chr/chrom/chromosome)')
-  }
-  pos_col <- intersect(c('pos_bp', 'pos', 'position', 'bp', 'poshg38', 'poshg19'), colnames(df))
-  if (length(pos_col) == 0) {
-    stop('变异信息缺少位点列 (pos, position, pos_bp, poshg38, poshg19)')
-  }
-
-  raw_chr <- df[[chr_col[1]]]
-  chr_str <- toupper(as.character(raw_chr))
-  chr_str <- sub('^CHR', '', chr_str, ignore.case = TRUE)
-  chr_num <- suppressWarnings(as.integer(chr_str))
-  chr_num[is.na(chr_num) & chr_str == 'X'] <- 23L
-  chr_num[is.na(chr_num) & chr_str == 'Y'] <- 24L
-  chr_num[is.na(chr_num) & chr_str %in% c('M', 'MT', 'MITO')] <- 25L
-  df$chr <- chr_num
-  df$pos_bp <- suppressWarnings(as.numeric(df[[pos_col[1]]]))
-
-  if (!'rsid' %in% colnames(df)) {
-    df$rsid <- paste0('chr', df$chr, ':', df$pos_bp)
-  }
-  df$rsid <- as.character(df$rsid)
-  df <- df[!is.na(df$chr) & !is.na(df$pos_bp), , drop = FALSE]
-  df <- df[order(df$chr, df$pos_bp), , drop = FALSE]
-  unique(df)
+  idx0 <- reticulate::py_to_r(py_env$ld_pruning(corr, threshold))
+  as.integer(idx0) + 1L
 }
 
 parse_trait_option <- function(x) {
   if (is.null(x) || is.na(x) || x == '') return(NULL)
   trimws(unlist(strsplit(x, ',')))
 }
-
-normalize_gwas_table <- function(gwas_df) {
-  if (is.null(gwas_df) || nrow(gwas_df) == 0) {
-    return(gwas_df)
-  }
-  df <- as.data.frame(gwas_df, stringsAsFactors = FALSE)
-  colnames(df) <- tolower(colnames(df))
-  if (!all(c('chr', 'pos') %in% colnames(df))) {
-    id_col <- intersect(c('rsid', 'snp', 'id', 'variant_id'), colnames(df))
-    if (length(id_col) > 0) {
-      id_vals <- as.character(df[[id_col[1]]])
-      parts <- strsplit(id_vals, ':', fixed = TRUE)
-      chr_raw <- vapply(parts, function(x) if (length(x) >= 1) x[1] else NA_character_, character(1), USE.NAMES = FALSE)
-      pos_raw <- vapply(parts, function(x) if (length(x) >= 2) x[2] else NA_character_, character(1), USE.NAMES = FALSE)
-      chr_clean <- toupper(chr_raw)
-      chr_clean <- sub('^CHR', '', chr_clean, ignore.case = TRUE)
-      chr_num <- suppressWarnings(as.integer(chr_clean))
-      chr_num[is.na(chr_num) & chr_clean == 'X'] <- 23L
-      chr_num[is.na(chr_num) & chr_clean == 'Y'] <- 24L
-      chr_num[is.na(chr_num) & chr_clean %in% c('M', 'MT', 'MITO')] <- 25L
-      pos_num <- suppressWarnings(as.numeric(gsub('[^0-9]', '', pos_raw)))
-      df$chr <- chr_num
-      df$pos <- pos_num
-    }
-  }
-  if (!'chr' %in% colnames(df)) {
-    alt_chr <- intersect(c('chrom', 'chromosome'), colnames(df))
-    if (length(alt_chr) > 0) df$chr <- suppressWarnings(as.integer(df[[alt_chr[1]]]))
-  }
-  if (!'pos' %in% colnames(df)) {
-    alt_pos <- intersect(c('position', 'bp', 'pos_bp'), colnames(df))
-    if (length(alt_pos) > 0) df$pos <- suppressWarnings(as.numeric(df[[alt_pos[1]]]))
-  }
-  df$chr <- suppressWarnings(as.integer(df$chr))
-  df$pos <- suppressWarnings(as.numeric(df$pos))
-  df <- df[!is.na(df$chr) & !is.na(df$pos), , drop = FALSE]
-  colnames(df) <- toupper(colnames(df))
-  df
-}
-
-detect_single_z_column <- function(df) {
-  if ('Z' %in% colnames(df)) return('Z')
-  numeric_cols <- names(df)[vapply(df, is.numeric, logical(1))]
-  numeric_cols <- setdiff(numeric_cols, c('CHR', 'POS', 'BP', 'N', 'SE', 'P', 'BETA'))
-  if (length(numeric_cols) == 1) {
-    return(numeric_cols[1])
-  }
-  NULL
-}
-
-auto_prepare_inputs <- function(zscore_path, panel_prefix, trait_cols = NULL, verbose = FALSE) {
-  if (!file.exists(zscore_path)) stop(paste('zscore文件不存在:', zscore_path))
-  bim <- paste0(panel_prefix, '.bim')
-  if (!file.exists(bim)) stop(paste('参考面板缺少 BIM 文件:', bim))
-
-  if (verbose) cat('读取zscore文件...\n')
-  z_dt <- data.table::fread(zscore_path, data.table = FALSE)
-  cols <- colnames(z_dt)
-  if (!all(c('CHR', 'POS') %in% cols)) {
-    id_col <- intersect(c('rsid', 'RSID', 'SNP', 'ID', 'variant_id'), cols)
-    if (length(id_col) == 0) stop('zscore文件缺少CHR/POS列，也无法从rsid推断')
-    id_vals <- as.character(z_dt[[id_col[1]]])
-    pieces <- strsplit(id_vals, ':', fixed = TRUE)
-    chr_raw <- vapply(pieces, function(x) if (length(x) >= 1) x[1] else NA_character_, character(1), USE.NAMES = FALSE)
-    pos_raw <- vapply(pieces, function(x) if (length(x) >= 2) x[2] else NA_character_, character(1), USE.NAMES = FALSE)
-    chr_clean <- toupper(chr_raw)
-    chr_clean <- sub('^CHR', '', chr_clean, ignore.case = TRUE)
-    chr_num <- suppressWarnings(as.integer(chr_clean))
-    chr_num[is.na(chr_num) & chr_clean == 'X'] <- 23L
-    chr_num[is.na(chr_num) & chr_clean == 'Y'] <- 24L
-    chr_num[is.na(chr_num) & chr_clean %in% c('M', 'MT', 'MITO')] <- 25L
-    pos_num <- suppressWarnings(as.integer(gsub('[^0-9]', '', pos_raw)))
-    z_dt$CHR <- chr_num
-    z_dt$POS <- pos_num
-  }
-  z_dt$CHR <- suppressWarnings(as.integer(z_dt$CHR))
-  z_dt$POS <- suppressWarnings(as.integer(z_dt$POS))
-  if (!all(c('CHR', 'POS') %in% colnames(z_dt))) stop('zscore文件仍缺少CHR/POS列')
-
-  numeric_cols <- names(z_dt)[vapply(z_dt, is.numeric, logical(1))]
-  numeric_cols <- setdiff(numeric_cols, c('CHR', 'POS', 'BP', 'N', 'SE', 'P', 'BETA'))
-  if (!is.null(trait_cols)) {
-    trait_cols <- trimws(unlist(strsplit(trait_cols, ',')))
-    if (!all(trait_cols %in% numeric_cols)) {
-      missing_cols <- setdiff(trait_cols, numeric_cols)
-      stop(paste('zscore文件缺少指定的trait列:', paste(missing_cols, collapse = ', ')))
-    }
-  } else {
-    trait_cols <- numeric_cols
-  }
-  trait_cols <- trait_cols[seq_len(min(length(trait_cols), 2))]
-  if (length(trait_cols) == 0) stop('无法确定zscore中的trait列')
-
-  for (col in trait_cols) {
-    z_dt[[col]] <- as.numeric(z_dt[[col]])
-  }
-  primary_col <- trait_cols[1]
-  z_dt$Z <- as.numeric(z_dt[[primary_col]])
-  z_dt <- z_dt[!is.na(z_dt$CHR) & !is.na(z_dt$POS) & !is.na(z_dt$Z), ]
-  z_dt <- z_dt[!duplicated(z_dt[c('CHR', 'POS')]), ]
-  if (nrow(z_dt) == 0) stop('zscore文件有效记录为0')
-
-  if (verbose) cat('读取参考面板BIM并匹配...\n')
-  map_dt <- data.table::fread(bim, col.names = c('CHR', 'RSID', 'CM', 'POS', 'A1', 'A2'), data.table = FALSE)
-  map_dt$CHR <- suppressWarnings(as.integer(map_dt$CHR))
-  merged <- merge(map_dt, z_dt, by = c('CHR', 'POS'))
-  if (nrow(merged) == 0) stop('参考面板与zscore在CHR+POS上没有重叠')
-
-  info_df <- merged[, c('RSID', 'CHR', 'POS')]
-  colnames(info_df) <- c('rsid', 'chr', 'pos_bp')
-
-  safe_base <- gsub('[^A-Za-z0-9_]+', '_', tools::file_path_sans_ext(basename(zscore_path)))
-  info_path <- tempfile(paste0('auto_info_', safe_base, '_'), fileext = '.csv')
-  data.table::fwrite(info_df, info_path)
-
-  gwas_paths <- character()
-  trait_names <- character()
-  for (trait in trait_cols) {
-    gwas_df <- merged[, c('CHR', 'POS', trait)]
-    colnames(gwas_df) <- c('CHR', 'POS', 'Z')
-    gwas_path <- tempfile(paste0('auto_gwas_', safe_base, '_', trait, '_'), fileext = '.tsv')
-    data.table::fwrite(gwas_df, gwas_path, sep = '\t')
-    gwas_paths <- c(gwas_paths, gwas_path)
-    trait_names <- c(trait_names, trait)
-  }
-  if (verbose) cat(sprintf('自动生成Info与GWAS：%d 个变异\n', nrow(info_df)))
-  list(info = info_path, gwas = list(paths = gwas_paths, traits = trait_names))
-}
-
-load_gwas_for_info <- function(gwas_file, variant_info) {
-  if (is.null(gwas_file)) return(NULL)
-  if (!file.exists(gwas_file)) stop(paste('GWAS文件不存在:', gwas_file))
-  gwas <- read.table(gwas_file, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
-  gwas <- normalize_gwas_table(gwas)
-  if (!all(c('CHR', 'POS', 'Z') %in% colnames(gwas))) {
-    stop('GWAS文件需要包含 CHR, POS, Z 列或可推断的位置信息')
-  }
-  gwas <- gwas[!is.na(gwas$CHR) & !is.na(gwas$POS), , drop = FALSE]
-  merged <- merge(variant_info, gwas, by.x = c('chr', 'pos_bp'), by.y = c('CHR', 'POS'))
-  if (nrow(merged) == 0) {
-    stop('变异信息与GWAS在CHR+POS上没有交集')
-  }
-  merged
-}
-
-load_multi_gwas_for_info <- function(multi_file, zcols, variant_info) {
-  if (is.null(multi_file) || is.null(zcols)) return(NULL)
-  if (!file.exists(multi_file)) stop(paste('multi_gwas 文件不存在:', multi_file))
-  gwas <- read.table(multi_file, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
-  gwas <- normalize_gwas_table(gwas)
-  if (!all(c('CHR', 'POS') %in% colnames(gwas))) {
-    stop('multi_gwas 缺少CHR/POS信息，且无法从rsid推断')
-  }
-  gwas <- gwas[!is.na(gwas$CHR) & !is.na(gwas$POS), ]
-  gwas <- gwas[!duplicated(gwas[c('CHR', 'POS')]), ]
-  zlist <- unlist(strsplit(zcols, ','))
-  zlist <- trimws(zlist)
-  if (length(zlist) < 1) stop('--zcols 至少需要提供一个列名')
-  if (!all(zlist %in% colnames(gwas))) {
-    stop(paste('--zcols 列不存在:', paste(setdiff(zlist, colnames(gwas)), collapse = ', ')))
-  }
-  m <- merge(variant_info, gwas, by.x = c('chr', 'pos_bp'), by.y = c('CHR', 'POS'))
-  if (nrow(m) == 0) stop('变异信息与multi_gwas无法匹配')
-  list(data = m, zcols = zlist)
-}
-
-#' 读取遗传变异信息文件
-load_variant_info <- function(info_file) {
-  tryCatch({
-    if (file.exists(info_file)) {
-      info <- read_csv(info_file, show_col_types = FALSE)
-      info <- standardize_variant_info(info)
-      return(info)
-    } else {
-      warning(paste("文件不存在:", info_file))
-      return(NULL)
-    }
-  }, error = function(e) {
-    warning(paste("读取文件出错:", info_file, "-", e$message))
-    return(NULL)
-  })
-}
-
-#' 加载真实GWAS汇总统计数据
-load_gwas_summary_stats <- function(gwas_file, variant_info = NULL) {
-  tryCatch({
-    if (!file.exists(gwas_file)) {
-      stop(paste("GWAS文件不存在:", gwas_file))
-    }
-    gwas_data <- read.table(gwas_file, header = TRUE, stringsAsFactors = FALSE)
-    required_cols <- c("CHR", "POS", "Z")
-    if (!all(required_cols %in% colnames(gwas_data))) {
-      stop(paste("GWAS文件缺少必需列:", paste(setdiff(required_cols, colnames(gwas_data)), collapse = ", ")))
-    }
-    gwas_data$CHR <- suppressWarnings(as.integer(gwas_data$CHR))
-    gwas_data$POS <- suppressWarnings(as.numeric(gwas_data$POS))
-    gwas_data <- gwas_data[!is.na(gwas_data$CHR) & !is.na(gwas_data$POS), , drop = FALSE]
-
-    if (!is.null(variant_info)) {
-      matched <- merge(variant_info, gwas_data, by.x = c("chr", "pos_bp"), by.y = c("CHR", "POS"))
-      if (nrow(matched) == 0) {
-        stop("变异信息与GWAS在CHR+POS上没有交集")
-      }
-      result <- matched[, c("rsid", "chr", "pos_bp"), drop = FALSE]
-      result$zscore_pheno1 <- matched$Z
-      if ("Z2" %in% colnames(matched)) {
-        result$zscore_pheno2 <- matched$Z2
-      } else if ("Z_pheno2" %in% colnames(matched)) {
-        result$zscore_pheno2 <- matched$Z_pheno2
-      } else if ("zscore_pheno2" %in% colnames(matched)) {
-        result$zscore_pheno2 <- matched$zscore_pheno2
-      } else {
-        result$zscore_pheno2 <- rep(NA_real_, nrow(result))
-      }
-      return(result)
-    }
-    gwas_data <- gwas_data[order(gwas_data$CHR, gwas_data$POS), , drop = FALSE]
-    return(gwas_data)
-  }, error = function(e) {
-    warning(paste("加载GWAS数据失败:", e$message))
-    return(NULL)
-  })
-}
-
-load_ld_blocks <- function(build, base_dir = '.') {
-  if (is.null(build) || is.na(build) || build == '') {
-    stop('必须指定LD block坐标版本 (GRCh37 或 GRCh38)')
-  }
-  key <- toupper(trimws(build))
-  file_map <- c(
-    GRCH37 = 'LAVA_s2500_m25_f1_w200.blocks',
-    GRCH38 = 'deCODE_EUR_LD_blocks.bed'
-  )
-  if (!key %in% names(file_map)) {
-    stop("未知的LD坐标版本: ", build, ". 仅支持 GRCh37 或 GRCh38")
-  }
-  candidate <- file_map[[key]]
-  paths <- c(candidate, file.path(base_dir, candidate))
-  path <- paths[file.exists(paths)][1]
-  if (is.na(path)) {
-    stop('无法找到LD blocks文件: ', candidate)
-  }
-  blocks <- data.table::fread(path, data.table = FALSE)
-  if (nrow(blocks) == 0) {
-    stop('LD blocks文件为空: ', path)
-  }
-  colnames(blocks) <- tolower(colnames(blocks))
-  if (!'chr' %in% colnames(blocks)) {
-    stop('LD blocks文件缺少chr列: ', path)
-  }
-  if (!('stop' %in% colnames(blocks) || 'end' %in% colnames(blocks))) {
-    stop('LD blocks文件缺少stop/end列: ', path)
-  }
-  blocks$chr <- gsub('^chr', '', blocks$chr, ignore.case = TRUE)
-  blocks$chr <- suppressWarnings(as.integer(blocks$chr))
-  if ('stop' %in% colnames(blocks)) {
-    blocks$end <- blocks$stop
-  }
-  blocks$start <- suppressWarnings(as.numeric(blocks$start))
-  blocks$end <- suppressWarnings(as.numeric(blocks$end))
-  blocks <- blocks[!is.na(blocks$chr) & !is.na(blocks$start) & !is.na(blocks$end), , drop = FALSE]
-  blocks <- blocks[order(blocks$chr, blocks$start, blocks$end), , drop = FALSE]
-  blocks$source_build <- key
-  blocks
-}
-
 load_gene_catalog <- function(coord, base_dir = '.') {
-  key <- toupper(trimws(coord))
-  file_map <- c(
-    GRCH37 = 'coding.genes.TSS.hg19.tsv',
-    GRCH38 = 'coding.genes.hg38.tsv'
+  genes <- reticulate::py_to_r(py_env$load_gene_catalog(coord, base_dir))
+  as.data.frame(genes, stringsAsFactors = FALSE)
+}
+
+load_genotype_rds <- function(path) {
+  obj <- readRDS(path)
+  if (!is.matrix(obj)) stop('RDS文件未包含matrix对象')
+  storage.mode(obj) <- 'numeric'
+  obj
+}
+
+python_partition_ld_blocks <- function(chr_vec, pos_vec, coord, workers = NULL, fallback = TRUE) {
+  args <- list(
+    chromosomes = as.integer(chr_vec),
+    positions = as.numeric(pos_vec),
+    coord_version = coord,
+    fallback = fallback
   )
-  if (!key %in% names(file_map)) {
-    stop('未知的坐标版本: ', coord, '。gene catalog 仅支持 GRCh37/GRCh38')
+  if (!is.null(workers)) {
+    args$workers <- as.integer(workers)
   }
-  candidate <- file_map[[key]]
-  paths <- c(candidate, file.path(base_dir, candidate))
-  path <- paths[file.exists(paths)][1]
-  if (is.na(path)) {
-    stop('找不到 gene catalog 文件: ', candidate)
-  }
-  genes <- data.table::fread(path, data.table = FALSE)
-  colnames(genes) <- tolower(colnames(genes))
-  required_cols <- c('id', 'chr', 'start', 'end')
-  missing_cols <- setdiff(required_cols, colnames(genes))
-  if (length(missing_cols) > 0) {
-    stop('gene catalog 缺少列: ', paste(missing_cols, collapse = ', '))
-  }
-  genes$chr <- gsub('^chr', '', genes$chr, ignore.case = TRUE)
-  genes$chr <- suppressWarnings(as.integer(genes$chr))
-  genes$start <- suppressWarnings(as.numeric(genes$start))
-  genes$end <- suppressWarnings(as.numeric(genes$end))
-  genes <- genes[!is.na(genes$chr) & !is.na(genes$start) & !is.na(genes$end), , drop = FALSE]
-  genes <- genes[order(genes$chr, genes$start, genes$end), , drop = FALSE]
-  genes
+  py_res <- do.call(py_env$partition_ld_blocks, args)
+  reticulate::py_to_r(py_res)
 }
 
 nearest_gene_annotation <- function(chrs, positions, gene_catalog) {
   if (is.null(gene_catalog) || nrow(gene_catalog) == 0) {
     return(rep(NA_character_, length(positions)))
   }
-  chrs <- as.integer(chrs)
-  positions <- as.numeric(positions)
-  res <- rep(NA_character_, length(positions))
-  vals <- seq_along(positions)
-  valid <- !is.na(chrs) & !is.na(positions)
-  if (!any(valid)) return(res)
-  for (chr_val in sort(unique(chrs[valid]))) {
-    idx_var <- vals[valid & chrs == chr_val]
-    if (length(idx_var) == 0) next
-    genes_chr <- gene_catalog[gene_catalog$chr == chr_val, , drop = FALSE]
-    if (nrow(genes_chr) == 0) {
-      res[idx_var] <- NA_character_
-      next
-    }
-    starts <- genes_chr$start
-    ends <- genes_chr$end
-    ids <- genes_chr$id
-    pos_vec <- positions[idx_var]
-    interval_idx <- findInterval(pos_vec, starts)
-    prev_idx <- pmax(interval_idx, 1L)
-    next_idx <- pmin(interval_idx + 1L, nrow(genes_chr))
-    # distance to previous gene
-    prev_start <- starts[prev_idx]
-    prev_end <- ends[prev_idx]
-    dist_prev <- ifelse(pos_vec >= prev_start & pos_vec <= prev_end, 0,
-                        pmin(abs(pos_vec - prev_start), abs(pos_vec - prev_end)))
-    # distance to next gene
-    next_start <- starts[next_idx]
-    next_end <- ends[next_idx]
-    dist_next <- ifelse(pos_vec >= next_start & pos_vec <= next_end, 0,
-                        pmin(abs(pos_vec - next_start), abs(pos_vec - next_end)))
-    choose_prev <- dist_prev <= dist_next
-    chosen_ids <- ifelse(choose_prev, ids[prev_idx], ids[next_idx])
-    res[idx_var] <- chosen_ids
-  }
-  res
+  py_gene <- reticulate::r_to_py(gene_catalog)
+  reticulate::py_to_r(py_env$annotate_nearest_gene(as.integer(chrs), as.numeric(positions), py_gene))
 }
 
 plot_manhattan_w <- function(df, out_path, title = 'Manhattan plot (W statistic)') {
   df <- df[!is.na(df$chr) & !is.na(df$pos) & !is.na(df$W), , drop = FALSE]
   if (nrow(df) == 0) return(invisible())
   df <- df[order(df$chr, df$pos), , drop = FALSE]
-  df$logp <- abs(df$W)
-  chr_levels <- sort(unique(df$chr))
+
+  df$CHR <- as.integer(df$chr)
+  df$BP <- as.numeric(df$pos)
+  df$SNP <- ifelse(!is.na(df$id) & nzchar(df$id), df$id, paste0(df$CHR, ':', df$BP))
+  df$absW <- abs(df$W)
+  df$P <- 10^(-df$absW)  # ensures -log10(P) == |W|
+
   colors <- c('#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b')
   highlight_color <- '#e41a1c'
-  df$color <- colors[(match(df$chr, chr_levels) - 1) %% length(colors) + 1]
-  offsets <- numeric(length(chr_levels))
-  names(offsets) <- chr_levels
-  cumulative <- 0
+  highlight_snps <- df$SNP[which(df$selected %in% TRUE)]
+
+  chr_levels <- sort(unique(df$CHR))
+  df$color <- colors[(match(df$CHR, chr_levels) - 1) %% length(colors) + 1]
+  df$cum_pos <- rep(NA_real_, nrow(df))
   tick_pos <- numeric(length(chr_levels))
+  cumulative <- 0
   for (i in seq_along(chr_levels)) {
-    chr <- chr_levels[i]
-    chr_rows <- which(df$chr == chr)
-    offsets[i] <- cumulative
-    df$cum_pos[chr_rows] <- df$pos[chr_rows] + cumulative
-    tick_pos[i] <- cumulative + stats::median(df$pos[chr_rows])
-    cumulative <- cumulative + max(df$pos[chr_rows])
+    chr_val <- chr_levels[i]
+    idx <- which(df$CHR == chr_val)
+    if (length(idx) == 0) next
+    df$cum_pos[idx] <- df$BP[idx] + cumulative
+    tick_pos[i] <- cumulative + stats::median(df$BP[idx])
+    cumulative <- cumulative + max(df$BP[idx])
   }
+
   png(out_path, width = 1600, height = 600)
   old_par <- par(no.readonly = TRUE)
   on.exit({par(old_par); dev.off()}, add = TRUE)
   par(mar = c(5, 5, 3, 1))
-  plot(df$cum_pos, df$logp, col = df$color, pch = 16, cex = 0.7,
-       xaxt = 'n', xlab = 'Chromosome', ylab = 'W statistic', main = title,
-       cex.axis = 1.2, cex.lab = 1.4, cex.main = 1.6, las = 1, font.main = 2, font.lab = 2)
-  if (any(df$selected, na.rm = TRUE)) {
-    points(df$cum_pos[df$selected], df$logp[df$selected], col = highlight_color, pch = 16, cex = 0.9)
+
+  if (requireNamespace('qqman', quietly = TRUE)) {
+    plot_df <- df[, c('CHR', 'BP', 'SNP', 'P')]
+    qqman::manhattan(
+      plot_df,
+      chr = 'CHR',
+      bp = 'BP',
+      p = 'P',
+      snp = 'SNP',
+      logp = TRUE,
+      ylab = 'W statistic',
+      col = colors,
+      highlight = highlight_snps,
+      suggestiveline = FALSE,
+      genomewideline = FALSE,
+      main = title,
+      cex = 0.7,
+      cex.axis = 1.2,
+      cex.lab = 1.4,
+      cex.main = 1.6,
+      las = 1
+    )
+    if (length(highlight_snps) > 0) {
+      idx <- df$SNP %in% highlight_snps
+      points(df$cum_pos[idx], df$absW[idx], col = highlight_color, pch = 16, cex = 0.9)
+    }
+  } else {
+    warning('qqman 未安装，使用基础图形绘制曼哈顿图')
+    plot(df$cum_pos, df$absW, col = df$color, pch = 16, cex = 0.7,
+         xaxt = 'n', xlab = 'Chromosome', ylab = 'W statistic', main = title,
+         cex.axis = 1.2, cex.lab = 1.4, cex.main = 1.6, las = 1, font.main = 2, font.lab = 2)
+    axis(1, at = tick_pos, labels = chr_levels, cex.axis = 1.2)
+    if (any(df$selected, na.rm = TRUE)) {
+      idx <- which(df$selected %in% TRUE)
+      points(df$cum_pos[idx], df$absW[idx], col = highlight_color, pch = 16, cex = 0.9)
+    }
   }
-  axis(1, at = tick_pos, labels = chr_levels, cex.axis = 1.2)
-  grid(nx = NA, ny = NULL, col = '#dddddd', lty = 3)
-  legend('topright', legend = c('Variants', 'Selected'), col = c(colors[1], highlight_color),
-         pch = 16, cex = 1.0, bty = 'n')
+
+  if (length(highlight_snps) > 0) {
+    legend_cols <- c(colors[1], highlight_color)
+    legend('topright', legend = c('Variants', 'Selected'), col = legend_cols,
+           pch = 16, cex = 1.0, bty = 'n')
+  } else {
+    legend('topright', legend = 'Variants', col = colors[1], pch = 16, cex = 1.0, bty = 'n')
+  }
   invisible()
 }
 
-load_genotype_rds <- function(path) {
-  obj <- readRDS(path)
-  if (!is.matrix(obj)) stop('RDS未包含matrix对象')
-  storage.mode(obj) <- 'numeric'
-  obj
-}
-
-load_genotype_csv <- function(path, fmt = c('samples_by_snps', 'snps_by_samples')) {
-  fmt <- match.arg(fmt)
-  m <- suppressWarnings(as.data.frame(data.table::fread(path)))
-  M <- as.matrix(m)
-  storage.mode(M) <- 'numeric'
-  if (fmt == 'snps_by_samples') {
-    M <- t(M)
-  }
-  M
-}
-
 load_genotype_plink <- function(prefix, snp_ids = NULL, chrpos_ids = NULL) {
-  if (!requireNamespace('snpStats', quietly = TRUE)) {
-    stop("需要安装snpStats包以读取PLINK文件，请运行 install.packages('snpStats')")
-  }
-  bed <- paste0(prefix, '.bed')
-  bim <- paste0(prefix, '.bim')
-  fam <- paste0(prefix, '.fam')
-  if (!file.exists(bed) || !file.exists(bim) || !file.exists(fam)) {
-    stop(paste0('PLINK文件缺失，请检查前缀: ', prefix))
-  }
-  if (!is.null(snp_ids)) {
-    snp_ids <- unique(stats::na.omit(snp_ids))
-    snp_ids <- snp_ids[nchar(snp_ids) > 0]
-  }
-  if (!is.null(chrpos_ids)) {
-    chrpos_ids <- unique(stats::na.omit(chrpos_ids))
-    chrpos_ids <- chrpos_ids[nchar(chrpos_ids) > 0]
-    if (length(chrpos_ids) > 0) {
-      map_dt <- data.table::fread(bim, col.names = c('chr', 'rsid', 'cm', 'pos', 'a1', 'a2'), showProgress = FALSE)
-      map_dt[, chrpos_key := paste0(chr, ':', pos)]
-      matched_ids <- unique(map_dt[chrpos_key %in% chrpos_ids, rsid])
-      snp_ids <- unique(c(snp_ids, matched_ids))
-    }
-  }
-  if (!is.null(snp_ids) && length(snp_ids) == 0) {
-    snp_ids <- NULL
-  }
-  plink <- snpStats::read.plink(bed, bim, fam, select.snps = snp_ids)
-  geno <- plink$genotypes
-  if (is.null(geno) || ncol(geno) == 0) {
-    stop('PLINK文件未读取到任何SNP (可能过滤条件过严)')
-  }
-  G <- as(geno, 'numeric')
-  storage.mode(G) <- 'numeric'
-  if (anyNA(G)) {
-    col_means <- colMeans(G, na.rm = TRUE)
-    na_idx <- which(is.na(G), arr.ind = TRUE)
-    if (length(na_idx) > 0) {
-      G[na_idx] <- col_means[na_idx[, 2]]
-      G[is.na(G)] <- 0
-    }
-  }
-  map <- plink$map
-  chrpos <- paste0(map$chromosome, ':', map$position)
-  rsid <- map$snp.name
-  colnames(G) <- ifelse(!is.na(rsid) & rsid != '', rsid, chrpos)
-  attr(G, 'chrpos') <- chrpos
-  attr(G, 'rsid') <- rsid
-  list(matrix = G, map = map)
+  res <- reticulate::py_to_r(py_env$load_genotype_plink(prefix, snp_ids, chrpos_ids))
+  geno_matrix <- res$matrix
+  if (!is.null(res$colnames)) colnames(geno_matrix) <- res$colnames
+  if (!is.null(res$chrpos)) attr(geno_matrix, 'chrpos') <- res$chrpos
+  if (!is.null(res$rsid)) attr(geno_matrix, 'rsid') <- res$rsid
+  map_df <- if (!is.null(res$map)) as.data.frame(res$map, stringsAsFactors = FALSE) else NULL
+  list(matrix = geno_matrix, map = map_df)
 }
 
-align_genotype_to_gwas <- function(G, gwas_df, prefer_rsid = TRUE) {
-  if (is.null(colnames(G)) && is.null(attr(G, 'chrpos'))) {
-    stop('基因型矩阵缺少列名或位置信息，无法对齐')
+align_genotype_to_gwas <- function(geno_matrix, gwas_df, prefer_rsid = TRUE) {
+  res <- reticulate::py_to_r(py_env$align_genotype_to_gwas(
+    geno_matrix,
+    colnames(geno_matrix),
+    attr(geno_matrix, 'chrpos'),
+    attr(geno_matrix, 'rsid'),
+    gwas_df,
+    prefer_rsid
+  ))
+  geno_selected <- res$matrix
+  if (!is.null(res$variant_ids)) {
+    colnames(geno_selected) <- res$variant_ids
+    attr(geno_selected, 'chrpos') <- res$variant_ids
   }
-  col_ids <- colnames(G)
-  chrpos <- paste0(gwas_df$chr, ':', gwas_df$pos_bp)
-  chrpos_attr <- attr(G, 'chrpos')
-  rsid_attr <- attr(G, 'rsid')
-
-  if (prefer_rsid && !is.null(gwas_df$rsid) && !is.null(col_ids)) {
-    idx <- match(gwas_df$rsid, col_ids)
-    matched <- which(!is.na(idx))
-    if (length(matched) >= 2) {
-      G2 <- G[, idx[matched], drop = FALSE]
-      new_ids <- chrpos[matched]
-      colnames(G2) <- new_ids
-      if (!is.null(rsid_attr)) {
-        attr(G2, 'rsid') <- rsid_attr[idx[matched]]
-      }
-      return(list(G = G2, matched = length(matched), ids = new_ids, pos = gwas_df$pos_bp[matched]))
-    }
+  if (!is.null(res$rsid)) {
+    attr(geno_selected, 'rsid') <- res$rsid
   }
-  if (!is.null(col_ids)) {
-    idx <- match(chrpos, col_ids)
-    matched <- which(!is.na(idx))
-    if (length(matched) >= 2) {
-      G2 <- G[, idx[matched], drop = FALSE]
-      new_ids <- chrpos[matched]
-      colnames(G2) <- new_ids
-      if (!is.null(rsid_attr)) {
-        attr(G2, 'rsid') <- rsid_attr[idx[matched]]
-      }
-      return(list(G = G2, matched = length(matched), ids = new_ids, pos = gwas_df$pos_bp[matched]))
-    }
-  }
-  if (!is.null(chrpos_attr)) {
-    idx <- match(chrpos, chrpos_attr)
-    matched <- which(!is.na(idx))
-    if (length(matched) >= 2) {
-      G2 <- G[, idx[matched], drop = FALSE]
-      new_ids <- chrpos[matched]
-      colnames(G2) <- new_ids
-      if (!is.null(rsid_attr)) {
-        attr(G2, 'rsid') <- rsid_attr[idx[matched]]
-      }
-      return(list(G = G2, matched = length(matched), ids = new_ids, pos = gwas_df$pos_bp[matched]))
-    }
-  }
-  stop('基因型列名与GWAS变异无法对齐 (尝试rsid与chr:pos均失败)')
+  list(
+    matrix = geno_selected,
+    gwas_indices = as.integer(res$gwas_indices),
+    matched = as.integer(res$matched),
+    variant_ids = res$variant_ids,
+    positions = as.numeric(res$positions),
+    rsid = res$rsid
+  )
 }
 
-# =============================================================================
-# 窗口管理函数
-# =============================================================================
+# 窗口管理函数 — 构建窗口区间
 
 #' 创建分析窗口
 create_analysis_windows <- function(variant_info, window_size = 100000, window_step = 50000) {
@@ -640,7 +228,6 @@ create_analysis_windows <- function(variant_info, window_size = 100000, window_s
   }
   
   positions <- positions[valid_indices]
-  valid_variant_info <- variant_info[valid_indices, ]
   
   min_pos <- min(positions)
   max_pos <- max(positions)
@@ -673,9 +260,7 @@ create_analysis_windows <- function(variant_info, window_size = 100000, window_s
   return(windows)
 }
 
-# =============================================================================
-# GhostKnockoff 相关函数
-# =============================================================================
+# GhostKnockoff 相关函数 — knockoff 分数生成
 
 #' 使用GhostKnockoff生成knockoff Z-scores（可接入真实基因型/LD）
 #' @param genotype_matrix 数值矩阵，维度: 样本×SNP；列名建议为 chr:pos 或 rsid（并与zscore对齐）
@@ -686,10 +271,9 @@ create_analysis_windows <- function(variant_info, window_size = 100000, window_s
 #' @param variant_positions 可选，数值向量，对应每个SNP的基因组位置（优先用于排序）
 #' @param verbose 逻辑，是否打印日志
 generate_ghostknockoff_scores <- function(genotype_matrix, zscore_matrix,
-                                        ld_threshold = 0.75, n_samples = 20000,
-                                        n_knockoffs = 5, variant_positions = NULL,
-                                        use_python_accel = FALSE,
-                                        verbose = FALSE) {
+                                          ld_threshold = 0.75, n_samples = 20000,
+                                          n_knockoffs = 5, variant_positions = NULL,
+                                          verbose = FALSE) {
   
   if (verbose) cat("开始生成GhostKnockoff分数...\n")
   
@@ -697,21 +281,21 @@ generate_ghostknockoff_scores <- function(genotype_matrix, zscore_matrix,
   genotype_matrix[genotype_matrix < 0 | genotype_matrix > 2] <- 0
   
   # 计算MAF和MAC
-  MAF <- colMeans(genotype_matrix) / 2
-  MAC <- colSums(genotype_matrix)
+  maf <- colMeans(genotype_matrix) / 2
+  mac <- colSums(genotype_matrix)
   s <- colMeans(genotype_matrix^2) - colMeans(genotype_matrix)^2
   
   # 过滤变异
-  SNP.index <- which(MAF > 0 & MAC >= 25 & s != 0 & !is.na(MAF))
+  snp_index <- which(maf > 0 & mac >= 25 & s != 0 & !is.na(maf))
   
-  if (length(SNP.index) < 5) {
+  if (length(snp_index) < 5) {
     warning("过滤后变异数量过少")
     return(NULL)
   }
   
-  genotype_matrix <- genotype_matrix[, SNP.index, drop = FALSE]
-  zscore_matrix <- zscore_matrix[SNP.index, , drop = FALSE]
-  keep_index <- SNP.index
+  genotype_matrix <- genotype_matrix[, snp_index, drop = FALSE]
+  zscore_matrix <- zscore_matrix[snp_index, , drop = FALSE]
+  keep_index <- snp_index
   
   # 按位置排序（优先使用提供的位置向量）
   if (!is.null(variant_positions)) {
@@ -724,10 +308,10 @@ generate_ghostknockoff_scores <- function(genotype_matrix, zscore_matrix,
   zscore_matrix <- zscore_matrix[order_idx, , drop = FALSE]
   keep_index <- keep_index[order_idx]
   
-  # LD过滤（支持Python加速）
+  # LD过滤（Python实现）
   if (ncol(genotype_matrix) > 1) {
-    cor.X <- if (use_python_accel) py_fast_correlation(genotype_matrix, verbose) else stats::cor(genotype_matrix)
-    keep_cols <- py_ld_pruning(cor.X, threshold = ld_threshold, verbose = verbose)
+    corr_matrix <- py_fast_correlation(genotype_matrix, verbose)
+    keep_cols <- py_ld_pruning(corr_matrix, threshold = ld_threshold, verbose = verbose)
     genotype_matrix <- genotype_matrix[, keep_cols, drop = FALSE]
     zscore_matrix <- zscore_matrix[keep_cols, , drop = FALSE]
     keep_index <- keep_index[keep_cols]
@@ -736,12 +320,12 @@ generate_ghostknockoff_scores <- function(genotype_matrix, zscore_matrix,
   if (verbose) cat(paste("LD过滤后变异数量:", ncol(genotype_matrix), "\n"))
   
   # 计算收缩LD矩阵
-  cor.G <- cor.shrink(genotype_matrix, verbose = FALSE)
+corr_shrink <- corpcor::cor.shrink(genotype_matrix, verbose = FALSE)
   
   # 生成knockoff
   tryCatch({
     set.seed(12345)
-    fit.prelim <- GhostKnockoff.prelim(cor.G, M = n_knockoffs, 
+    fit_prelim <- GhostKnockoff::GhostKnockoff.prelim(corr_shrink, M = n_knockoffs, 
                                       method = 'asdp', 
                                       max.size = ncol(genotype_matrix))
     
@@ -749,14 +333,14 @@ generate_ghostknockoff_scores <- function(genotype_matrix, zscore_matrix,
     knockoff_results <- list()
     
     for (pheno in seq_len(ncol(zscore_matrix))) {
-      GK.stat <- GhostKnockoff.fit(as.matrix(zscore_matrix[, pheno]), 
+      gk_fit <- GhostKnockoff::GhostKnockoff.fit(as.matrix(zscore_matrix[, pheno]), 
                                   n.study = n_samples,
-                                  fit.prelim = fit.prelim, 
+                                  fit.prelim = fit_prelim, 
                                   gamma = 1, 
                                   weight.study = NULL)
       
       # 组合原始和knockoff Z-scores
-      combined_scores <- cbind(zscore_matrix[, pheno], GK.stat$GK.Zscore_k)
+      combined_scores <- cbind(zscore_matrix[, pheno], gk_fit$GK.Zscore_k)
       colnames(combined_scores) <- c("org", paste0("knock", 1:n_knockoffs))
       
       knockoff_results[[paste0("pheno", pheno)]] <- combined_scores
@@ -772,9 +356,7 @@ generate_ghostknockoff_scores <- function(genotype_matrix, zscore_matrix,
   })
 }
 
-# =============================================================================
-# LAVA-Knock 分析函数
-# =============================================================================
+# LAVA-Knock 分析函数 — 单/双变量窗口统计
 
 #' 单变量遗传性检验
 run_univariate_analysis <- function(genotype_matrix, zscore_matrix, 
@@ -785,7 +367,7 @@ run_univariate_analysis <- function(genotype_matrix, zscore_matrix,
   if (verbose) cat("运行单变量遗传性分析...\n")
   
   tryCatch({
-    result <- LAVAKnock_univariate(
+    result <- LAVAKnock::LAVAKnock_univariate(
       Zscore = zscore_matrix,
       G_locus = genotype_matrix,
       chr = chr,
@@ -804,9 +386,7 @@ run_univariate_analysis <- function(genotype_matrix, zscore_matrix,
   })
 }
 
-# =============================================================================
-# GhostKnockoff 变量选择（单表型）
-# =============================================================================
+# GhostKnockoff 变量选择（单表型）— knockoff + FDR 控制
 
 #' 基于GhostKnockoff执行变量选择（单表型）
 #' @param genotype_matrix 矩阵，参考基因型，维度: 样本×SNP
@@ -822,11 +402,9 @@ run_ghostknockoff_selection <- function(genotype_matrix, z_vector,
                                         n_knockoffs = 5,
                                         fdr = 0.1,
                                         variant_ids = NULL,
-                                        use_python_accel = FALSE,
                                         verbose = FALSE) {
   if (is.null(genotype_matrix) || is.null(z_vector)) {
-    warning("genotype_matrix 或 z_vector 为空")
-    return(NULL)
+    stop("genotype_matrix 或 z_vector 为空")
   }
   if (is.matrix(z_vector) || is.data.frame(z_vector)) {
     z_vector <- as.numeric(z_vector[, 1])
@@ -852,7 +430,6 @@ run_ghostknockoff_selection <- function(genotype_matrix, z_vector,
     zscore_matrix = zscore_matrix,
     n_samples = n_samples,
     n_knockoffs = n_knockoffs,
-    use_python_accel = isTRUE(use_python_accel),
     verbose = verbose
   )
   if (is.null(gk) || is.null(gk$pheno1)) {
@@ -890,7 +467,7 @@ run_ghostknockoff_selection <- function(genotype_matrix, z_vector,
   }
 
   # 使用LAVAKnock进行FDR控制的选择
-  res <- LAVAKnock(
+  res <- LAVAKnock::LAVAKnock(
     M = n_knockoffs,
     p0 = p0,
     p_ko = as.matrix(pko),
@@ -921,175 +498,6 @@ run_ghostknockoff_selection <- function(genotype_matrix, z_vector,
   )
 }
 
-run_block_selection <- function(genotype_matrix, z_vector, variant_ids, variant_chr, variant_pos,
-                                blocks_df, n_samples, n_knockoffs, fdr, use_python_accel, verbose) {
-  if (ncol(genotype_matrix) != length(z_vector) || length(z_vector) != length(variant_ids)) {
-    stop('变异信息与基因型矩阵长度不一致')
-  }
-
-  variant_chr <- suppressWarnings(as.integer(variant_chr))
-  variant_pos <- suppressWarnings(as.numeric(variant_pos))
-  valid <- !is.na(variant_chr) & !is.na(variant_pos)
-  if (sum(valid) < 5) {
-    warning('可用于LD blocks的变异数量不足')
-    return(NULL)
-  }
-  if (!all(valid)) {
-    invalid <- which(!valid)
-    genotype_matrix <- genotype_matrix[, valid, drop = FALSE]
-    z_vector <- z_vector[valid]
-    variant_ids <- variant_ids[valid]
-    variant_chr <- variant_chr[valid]
-    variant_pos <- variant_pos[valid]
-    warning(sprintf('已忽略 %d 个缺少chr/pos的变异', length(invalid)))
-  }
-
-  ord <- order(variant_chr, variant_pos, na.last = TRUE)
-  genotype_matrix <- genotype_matrix[, ord, drop = FALSE]
-  z_vector <- z_vector[ord]
-  variant_ids <- variant_ids[ord]
-  variant_chr <- variant_chr[ord]
-  variant_pos <- variant_pos[ord]
-
-  blocks_df <- blocks_df[blocks_df$chr %in% unique(variant_chr), , drop = FALSE]
-  blocks_df <- blocks_df[order(blocks_df$chr, blocks_df$start, blocks_df$end), , drop = FALSE]
-
-  combined_tbl <- data.frame()
-  chunk_summary <- data.frame(chunk_id = integer(), chr = integer(), start = numeric(), end = numeric(),
-                              n_snps = integer(), selected = integer(), source = character(),
-                              stringsAsFactors = FALSE)
-  chunk_tables <- list()
-  assigned <- rep(FALSE, length(variant_ids))
-
-  for (i in seq_len(nrow(blocks_df))) {
-    block_chr <- blocks_df$chr[i]
-    block_start <- blocks_df$start[i]
-    block_end <- blocks_df$end[i]
-    idx <- which(!assigned & variant_chr == block_chr & variant_pos >= block_start & variant_pos <= block_end)
-    if (length(idx) == 0) next
-    if (length(idx) < 5) {
-      next
-    }
-    chunk_id <- length(chunk_tables) + 1L
-    sub_G <- genotype_matrix[, idx, drop = FALSE]
-    sub_z <- z_vector[idx]
-    sub_ids <- variant_ids[idx]
-    if (verbose) {
-      cat(sprintf('Chunk %d: %d SNPs (chr %d: %d-%d)\n', chunk_id, length(idx), block_chr, floor(block_start), floor(block_end)))
-      cat(sprintf('  调用 GhostKnockoff (M=%d)\n', n_knockoffs))
-    }
-    res <- run_ghostknockoff_selection(
-      genotype_matrix = sub_G,
-      z_vector = sub_z,
-      n_samples = n_samples,
-      n_knockoffs = n_knockoffs,
-      fdr = fdr,
-      variant_ids = sub_ids,
-      use_python_accel = use_python_accel,
-      verbose = verbose
-    )
-    if (is.null(res)) next
-    assigned[idx] <- TRUE
-    tbl <- res$table
-    tbl$chunk_id <- chunk_id
-    tbl$chunk_chr <- block_chr
-    tbl$chunk_start <- block_start
-    tbl$chunk_end <- block_end
-    tbl$chunk_size_bp <- block_end - block_start + 1
-    tbl$partition_source <- 'ld_block'
-    combined_tbl <- rbind(combined_tbl, tbl)
-    chunk_summary <- rbind(chunk_summary, data.frame(
-      chunk_id = chunk_id,
-      chr = block_chr,
-      start = block_start,
-      end = block_end,
-      n_snps = length(idx),
-      selected = sum(tbl$selected),
-      source = 'ld_block',
-      stringsAsFactors = FALSE
-    ))
-    chunk_tables[[length(chunk_tables) + 1L]] <- list(
-      id = chunk_id,
-      chr = block_chr,
-      start = block_start,
-      end = block_end,
-      source = 'ld_block',
-      data = tbl
-    )
-  }
-
-  if (!all(assigned)) {
-    warning('部分变异不在预定义LD blocks中，按染色体范围回退切分')
-    leftover_idx <- which(!assigned)
-    leftover_chr <- unique(variant_chr[leftover_idx])
-    for (chr_val in leftover_chr) {
-      idx_chr <- leftover_idx[variant_chr[leftover_idx] == chr_val]
-      if (length(idx_chr) < 5) {
-        assigned[idx_chr] <- TRUE
-        next
-      }
-      block_start <- min(variant_pos[idx_chr], na.rm = TRUE)
-      block_end <- max(variant_pos[idx_chr], na.rm = TRUE)
-      chunk_id <- length(chunk_tables) + 1L
-      sub_G <- genotype_matrix[, idx_chr, drop = FALSE]
-      sub_z <- z_vector[idx_chr]
-      sub_ids <- variant_ids[idx_chr]
-      if (verbose) {
-        cat(sprintf('Chunk %d: %d SNPs (chr %d: %d-%d) [fallback]\n', chunk_id, length(idx_chr), chr_val, floor(block_start), floor(block_end)))
-        cat(sprintf('  调用 GhostKnockoff (M=%d)\n', n_knockoffs))
-      }
-      res <- run_ghostknockoff_selection(
-        genotype_matrix = sub_G,
-        z_vector = sub_z,
-        n_samples = n_samples,
-        n_knockoffs = n_knockoffs,
-        fdr = fdr,
-        variant_ids = sub_ids,
-        use_python_accel = use_python_accel,
-        verbose = verbose
-      )
-      if (is.null(res)) {
-        assigned[idx_chr] <- TRUE
-        next
-      }
-      assigned[idx_chr] <- TRUE
-      tbl <- res$table
-      tbl$chunk_id <- chunk_id
-      tbl$chunk_chr <- chr_val
-      tbl$chunk_start <- block_start
-      tbl$chunk_end <- block_end
-      tbl$chunk_size_bp <- block_end - block_start + 1
-      tbl$partition_source <- 'fallback'
-      combined_tbl <- rbind(combined_tbl, tbl)
-      chunk_summary <- rbind(chunk_summary, data.frame(
-        chunk_id = chunk_id,
-        chr = chr_val,
-        start = block_start,
-        end = block_end,
-        n_snps = length(idx_chr),
-        selected = sum(tbl$selected),
-        source = 'fallback',
-        stringsAsFactors = FALSE
-      ))
-      chunk_tables[[length(chunk_tables) + 1L]] <- list(
-        id = chunk_id,
-        chr = chr_val,
-        start = block_start,
-        end = block_end,
-        source = 'fallback',
-        data = tbl
-      )
-    }
-  }
-
-  if (nrow(combined_tbl) == 0) {
-    warning('LD 切块后未得到任何结果')
-    return(NULL)
-  }
-  ord_idx <- match(combined_tbl$id, variant_ids)
-  combined_tbl <- combined_tbl[order(combined_tbl$chunk_id, ord_idx), ]
-  list(table = combined_tbl, chunks = chunk_summary, chunk_tables = chunk_tables)
-}
 
 execute_pipeline <- function(opts) {
   auto_temp_paths <- character()
@@ -1100,20 +508,44 @@ execute_pipeline <- function(opts) {
   }
   panel_default <- if (!is.null(opts$panel)) opts$panel else if (!is.null(opts$ref_plink)) opts$ref_plink else file.path('g1000_eur', 'g1000_eur')
 
-  trait_option_str <- NULL
+  trait_option_vec <- NULL
   if (!is.null(opts$zscore_traits)) {
-    parsed_traits <- parse_trait_option(opts$zscore_traits)
-    if (!is.null(parsed_traits)) trait_option_str <- paste(parsed_traits, collapse = ',')
+    trait_option_vec <- parse_trait_option(opts$zscore_traits)
   }
 
   if (is.null(opts$info) && !is.null(opts$zscore)) {
-    auto_inputs <- auto_prepare_inputs(opts$zscore, panel_default, trait_cols = trait_option_str, verbose = opts$verbose)
-    opts$info <- auto_inputs$info
-    if (is.null(opts$gwas1)) opts$gwas1 <- auto_inputs$gwas$paths[1]
-    if (is.null(opts$gwas2) && length(auto_inputs$gwas$paths) >= 2) opts$gwas2 <- auto_inputs$gwas$paths[2]
+    trait_arg <- if (is.null(trait_option_vec)) NULL else as.list(trait_option_vec)
+    auto_res <- reticulate::py_to_r(py_env$auto_prepare_inputs(opts$zscore, panel_default, trait_arg, opts$verbose))
+    info_df <- as.data.frame(auto_res$variant_info, stringsAsFactors = FALSE)
+    safe_base <- gsub('[^A-Za-z0-9_]+', '_', tools::file_path_sans_ext(basename(opts$zscore)))
+    info_path <- tempfile(paste0('auto_info_', safe_base, '_'), fileext = '.csv')
+    readr::write_csv(info_df, info_path)
+
+    gwas_paths <- character()
+    trait_names <- if (is.null(auto_res$traits)) character() else as.character(auto_res$traits)
+    tables <- auto_res$gwas_tables
+    if (!is.null(tables)) {
+      if (length(trait_names) < length(tables)) {
+        auto_names <- paste0('trait', seq_along(tables))
+        trait_names <- head(c(trait_names, auto_names), length(tables))
+      }
+      for (i in seq_along(tables)) {
+        gwas_df <- as.data.frame(tables[[i]], stringsAsFactors = FALSE)
+        gwas_df <- gwas_df[!is.na(gwas_df$CHR) & !is.na(gwas_df$POS) & !is.na(gwas_df$Z), , drop = FALSE]
+        gwas_path <- tempfile(paste0('auto_gwas_', safe_base, '_', trait_names[i], '_'), fileext = '.tsv')
+        readr::write_tsv(gwas_df, gwas_path)
+        gwas_paths <- c(gwas_paths, gwas_path)
+      }
+    }
+    if (opts$verbose) {
+      cat(sprintf('自动生成Info与GWAS：%d 个变异\n', nrow(info_df)))
+    }
+    opts$info <- info_path
+    if (is.null(opts$gwas1) && length(gwas_paths) >= 1) opts$gwas1 <- gwas_paths[1]
+    if (is.null(opts$gwas2) && length(gwas_paths) >= 2) opts$gwas2 <- gwas_paths[2]
     if (is.null(opts$ref_plink)) opts$ref_plink <- panel_default
-    auto_temp_paths <- c(auto_temp_paths, auto_inputs$info, auto_inputs$gwas$paths)
-    auto_trait_names <- auto_inputs$gwas$traits
+    auto_temp_paths <- c(auto_temp_paths, info_path, gwas_paths)
+    auto_trait_names <- trait_names
   }
 
   if (is.null(opts$mode)) {
@@ -1135,28 +567,49 @@ execute_pipeline <- function(opts) {
 
   dir.create(opts$outdir, showWarnings = FALSE, recursive = TRUE)
 
-  ld_blocks <- load_ld_blocks(opts$ld_coord)
+  if (is.null(opts$ld_coord) || !nzchar(opts$ld_coord)) {
+    stop('必须提供 --ld_coord (GRCh37, GRCh38 或自定义LD block文件路径)')
+  }
+
   gene_catalog <- load_gene_catalog(opts$ld_coord)
 
-  info <- load_variant_info(opts$info)
+  info <- as.data.frame(reticulate::py_to_r(py_env$load_variant_info(opts$info)), stringsAsFactors = FALSE)
   if (is.null(info) || nrow(info) == 0) stop('变异信息文件读取失败或为空')
 
   g1 <- NULL
   g2 <- NULL
   if (!is.null(opts$gwas1)) {
-    g1 <- load_gwas_for_info(opts$gwas1, info)
+    gwas1_df <- as.data.frame(reticulate::py_to_r(py_env$load_gwas_table(opts$gwas1)), stringsAsFactors = FALSE)
+    gwas1_df$CHR <- as.integer(gwas1_df$CHR)
+    gwas1_df$POS <- as.numeric(gwas1_df$POS)
+    gwas1_df$Z <- as.numeric(gwas1_df$Z)
+    gwas1_df <- gwas1_df[!is.na(gwas1_df$CHR) & !is.na(gwas1_df$POS) & !is.na(gwas1_df$Z), , drop = FALSE]
+    g1 <- merge(info, gwas1_df, by.x = c('chr', 'pos_bp'), by.y = c('CHR', 'POS'))
+    if (nrow(g1) == 0) stop('变异信息与GWAS在CHR+POS上没有交集')
     if (!is.null(opts$gwas2)) {
-      g2 <- load_gwas_for_info(opts$gwas2, info)
+      gwas2_df <- as.data.frame(reticulate::py_to_r(py_env$load_gwas_table(opts$gwas2)), stringsAsFactors = FALSE)
+      gwas2_df$CHR <- as.integer(gwas2_df$CHR)
+      gwas2_df$POS <- as.numeric(gwas2_df$POS)
+      gwas2_df$Z <- as.numeric(gwas2_df$Z)
+      gwas2_df <- gwas2_df[!is.na(gwas2_df$CHR) & !is.na(gwas2_df$POS) & !is.na(gwas2_df$Z), , drop = FALSE]
+      g2 <- merge(info, gwas2_df, by.x = c('chr', 'pos_bp'), by.y = c('CHR', 'POS'))
+      if (nrow(g2) == 0) stop('变异信息与GWAS在CHR+POS上没有交集 (gwas2)')
     }
   } else if (!is.null(opts$multi_gwas) && !is.null(opts$zcols)) {
-    mg <- load_multi_gwas_for_info(opts$multi_gwas, opts$zcols, info)
-    zc <- mg$zcols
-    m <- mg$data
-    g1 <- m
-    g1$Z <- as.numeric(m[[zc[1]]])
+    mg <- reticulate::py_to_r(py_env$load_multi_gwas_table(opts$multi_gwas, opts$zcols))
+    m <- as.data.frame(mg$data, stringsAsFactors = FALSE)
+    m$CHR <- as.integer(m$CHR)
+    m$POS <- as.numeric(m$POS)
+    m <- m[!is.na(m$CHR) & !is.na(m$POS), , drop = FALSE]
+    merged <- merge(info, m, by.x = c('chr', 'pos_bp'), by.y = c('CHR', 'POS'))
+    if (nrow(merged) == 0) stop('变异信息与multi_gwas无法匹配')
+    zc <- as.character(mg$zcols)
+    if (length(zc) < 1) stop('未在 multi_gwas 中找到指定的Z列')
+    g1 <- merged
+    g1$Z <- as.numeric(merged[[zc[1]]])
     if (length(zc) >= 2) {
-      g2 <- m
-      g2$Z <- as.numeric(m[[zc[2]]])
+      g2 <- merged
+      g2$Z <- as.numeric(merged[[zc[2]]])
     }
   } else {
     stop('未提供 GWAS 输入。请使用 --gwas1/--gwas2 或 --multi_gwas 配合 --zcols')
@@ -1186,96 +639,149 @@ execute_pipeline <- function(opts) {
 
   target_snp_ids <- unique(stats::na.omit(gwas_data$rsid))
   chrpos_ids <- paste0(gwas_data$chr, ':', gwas_data$pos_bp)
-  plink_map <- NULL
   using_reference_panel <- FALSE
-  reference_prefix <- NULL
+
+  geno_raw <- NULL
 
   if (!is.null(opts$geno_rds)) {
     if (!file.exists(opts$geno_rds)) stop('geno_rds文件不存在')
-    G_raw <- load_genotype_rds(opts$geno_rds)
+    # RDS 文件仍由 R 端读取
+    geno_raw <- load_genotype_rds(opts$geno_rds)
   } else if (!is.null(opts$geno_csv)) {
     if (!file.exists(opts$geno_csv)) stop('geno_csv文件不存在')
-    G_raw <- load_genotype_csv(opts$geno_csv, fmt = opts$geno_format)
+    geno_raw <- reticulate::py_to_r(py_env$load_genotype_csv(opts$geno_csv, fmt = opts$geno_format))
   } else if (!is.null(opts$geno_plink)) {
-    plink_data <- load_genotype_plink(opts$geno_plink, snp_ids = target_snp_ids, chrpos_ids = chrpos_ids)
-    G_raw <- plink_data$matrix
-    plink_map <- plink_data$map
+    geno_raw <- load_genotype_plink(opts$geno_plink, snp_ids = target_snp_ids, chrpos_ids = chrpos_ids)$matrix
   } else {
     prefix <- if (!is.null(opts$ref_plink)) opts$ref_plink else file.path('g1000_eur', 'g1000_eur')
     using_reference_panel <- TRUE
-    reference_prefix <- prefix
     message('未提供真实基因型，自动使用参考面板: ', prefix)
-    plink_data <- load_genotype_plink(prefix, snp_ids = target_snp_ids, chrpos_ids = chrpos_ids)
-    G_raw <- plink_data$matrix
-    plink_map <- plink_data$map
+    geno_raw <- load_genotype_plink(prefix, snp_ids = target_snp_ids, chrpos_ids = chrpos_ids)$matrix
   }
 
   geno_source_type <- if (using_reference_panel) 'reference' else 'real'
 
-  ali <- align_genotype_to_gwas(G_raw, gwas_data, prefer_rsid = TRUE)
-  G <- ali$G
-  variant_positions <- ali$pos
+  pheno1_attr <- attr(gwas_data, 'pheno1_name')
+  pheno2_attr <- attr(gwas_data, 'pheno2_name')
+
+  ali <- align_genotype_to_gwas(geno_raw, gwas_data, prefer_rsid = TRUE)
+  geno_matrix <- ali$matrix
+  match_idx <- as.integer(ali$gwas_indices) + 1L
+  if (length(match_idx) < 2 || any(is.na(match_idx))) {
+    stop('基因型与GWAS变异匹配数量不足')
+  }
+  gwas_selected <- gwas_data[match_idx, , drop = FALSE]
+  variant_ids <- colnames(geno_matrix)
+  if (is.null(variant_ids)) {
+    variant_ids <- paste0(gwas_selected$chr, ':', gwas_selected$pos_bp)
+    colnames(geno_matrix) <- variant_ids
+  }
+  variant_positions <- as.numeric(ali$positions)
+  if (length(variant_positions) != length(variant_ids) || any(is.na(variant_positions))) {
+    variant_positions <- gwas_selected$pos_bp
+  }
+  z_vec <- as.numeric(gwas_selected$zscore_pheno1)
+  rsid_lookup <- ali$rsid
+  if (is.null(rsid_lookup) || length(rsid_lookup) != length(variant_ids)) {
+    rsid_lookup <- gwas_selected$rsid
+  }
+  rsid_lookup <- as.character(rsid_lookup)
+  attr(gwas_selected, 'pheno1_name') <- pheno1_attr
+  attr(gwas_selected, 'pheno2_name') <- pheno2_attr
+  gwas_data <- gwas_selected
 
   if (opts$mode == 'select') {
-    variant_ids <- colnames(G)
-    chrpos_all <- paste0(gwas_data$chr, ':', gwas_data$pos_bp)
-    match_idx <- match(variant_ids, chrpos_all)
-    if (any(is.na(match_idx))) {
-      warning('部分变异无法在GWAS数据中找到匹配，将忽略这些变异')
-      keep <- which(!is.na(match_idx))
-      if (length(keep) < 5) stop('可匹配的变异数量不足')
-      G <- G[, keep, drop = FALSE]
-      variant_ids <- colnames(G)
-      match_idx <- match(variant_ids, chrpos_all)
-      if (!is.null(variant_positions)) {
-        variant_positions <- variant_positions[keep]
-      }
+    if (length(variant_ids) < 5) {
+      stop('匹配到的变异数量不足以执行变量选择')
     }
-    z_vec <- gwas_data$zscore_pheno1[match_idx]
-    rsid_lookup <- gwas_data$rsid[match_idx]
 
     selection_table <- NULL
     chunk_summary <- NULL
-    chunk_res <- NULL
+    chunk_tables_data <- list()
+    chunk_records <- list()
     ld_reference_used <- NA_character_
 
-    variant_chr_vec <- gwas_data$chr[match_idx]
-    variant_pos_vec <- gwas_data$pos_bp[match_idx]
-    if (!is.null(variant_positions) && length(variant_positions) == length(variant_ids)) {
-      variant_pos_vec <- variant_positions
-    }
+    variant_chr_vec <- gwas_selected$chr
+    variant_pos_vec <- variant_positions
 
-    if (!is.null(ld_blocks) && nrow(ld_blocks) > 0) {
-      chunk_res <- run_block_selection(
-        genotype_matrix = G,
-        z_vector = z_vec,
-        variant_ids = variant_ids,
-        variant_chr = variant_chr_vec,
-        variant_pos = variant_pos_vec,
-        blocks_df = ld_blocks,
-        n_samples = opts$n,
-        n_knockoffs = opts$knockoffs,
-        fdr = opts$fdr,
-        use_python_accel = opts$py_accel,
-        verbose = opts$verbose
-      )
-      if (is.null(chunk_res)) {
-        stop('变量选择失败 (LD block阶段)')
+    chunk_plan <- python_partition_ld_blocks(
+      variant_chr_vec,
+      variant_pos_vec,
+      opts$ld_coord,
+      workers = opts$threads
+    )
+    chunk_list <- c(
+      if (!is.null(chunk_plan$chunks)) chunk_plan$chunks else list(),
+      if (!is.null(chunk_plan$fallback)) chunk_plan$fallback else list()
+    )
+
+    if (length(chunk_list) > 0) {
+      chunk_id <- 0L
+      for (chunk in chunk_list) {
+        idx0 <- as.integer(chunk$indices)
+        if (is.null(idx0) || length(idx0) < 5) next
+        idx <- idx0 + 1L
+        chunk_id <- chunk_id + 1L
+        sub_geno <- geno_matrix[, idx, drop = FALSE]
+        sub_z <- z_vec[idx]
+        sub_ids <- variant_ids[idx]
+        if (opts$verbose) {
+          cat(sprintf('Chunk %d: %d SNPs (chr %s: %.0f-%.0f)\n',
+                      chunk_id, length(idx), as.character(chunk$chr),
+                      as.numeric(chunk$start), as.numeric(chunk$end)))
+        }
+        res <- run_ghostknockoff_selection(
+          genotype_matrix = sub_geno,
+          z_vector = sub_z,
+          n_samples = opts$n,
+          n_knockoffs = opts$knockoffs,
+          fdr = opts$fdr,
+          variant_ids = sub_ids,
+          verbose = opts$verbose
+        )
+        if (is.null(res)) next
+        tbl <- res$table
+        chunk_chr <- as.integer(chunk$chr)
+        chunk_start <- as.numeric(chunk$start)
+        chunk_end <- as.numeric(chunk$end)
+        chunk_source <- if (!is.null(chunk$source)) as.character(chunk$source) else 'ld_block'
+        chunk_size_bp <- chunk_end - chunk_start + 1
+        tbl$chunk_id <- chunk_id
+        tbl$chunk_chr <- chunk_chr
+        tbl$chunk_start <- chunk_start
+        tbl$chunk_end <- chunk_end
+        tbl$chunk_size_bp <- chunk_size_bp
+        tbl$partition_source <- chunk_source
+        chunk_tables_data[[length(chunk_tables_data) + 1L]] <- tbl
+        chunk_records[[length(chunk_records) + 1L]] <- data.frame(
+          chunk_id = chunk_id,
+          chr = chunk_chr,
+          start = chunk_start,
+          end = chunk_end,
+          n_snps = length(idx),
+          selected = sum(tbl$selected),
+          source = chunk_source,
+          chunk_size_bp = chunk_size_bp,
+          stringsAsFactors = FALSE
+        )
+        rm(sub_geno, sub_z)
+        if (chunk_id %% 8 == 0) gc(FALSE)
       }
-      selection_table <- chunk_res$table
-      chunk_summary <- chunk_res$chunks
-      ld_reference_used <- opts$ld_coord
+      if (length(chunk_tables_data) > 0) {
+        selection_table <- do.call(rbind, chunk_tables_data)
+        chunk_summary <- do.call(rbind, chunk_records)
+        ld_reference_used <- opts$ld_coord
+      }
     }
 
     if (is.null(selection_table)) {
       sel <- run_ghostknockoff_selection(
-        genotype_matrix = G,
+        genotype_matrix = geno_matrix,
         z_vector = z_vec,
         n_samples = opts$n,
         n_knockoffs = opts$knockoffs,
         fdr = opts$fdr,
         variant_ids = variant_ids,
-        use_python_accel = opts$py_accel,
         verbose = opts$verbose
       )
       if (is.null(sel)) stop('变量选择失败')
@@ -1336,7 +842,6 @@ execute_pipeline <- function(opts) {
     readr::write_csv(summary_df, summary_csv)
 
     if (!is.null(chunk_summary) && nrow(chunk_summary) > 0) {
-      chunk_summary$chunk_size_bp <- chunk_summary$end - chunk_summary$start + 1
       if (!is.na(ld_reference_used)) {
         chunk_summary$ld_reference <- ld_reference_used
       }
@@ -1346,12 +851,10 @@ execute_pipeline <- function(opts) {
       chunk_dir <- file.path(out_dir, paste0(prefix, '_chunks'))
       if (dir.exists(chunk_dir)) unlink(chunk_dir, recursive = TRUE, force = TRUE)
       dir.create(chunk_dir, recursive = TRUE)
-      chunk_tables <- if (!is.null(chunk_res)) chunk_res$chunk_tables else list()
-      if (!is.null(chunk_tables) && length(chunk_tables) > 0) {
-        for (chunk_info in chunk_tables) {
-          chunk_tbl <- chunk_info$data
-          chunk_file <- file.path(chunk_dir, sprintf('%s_chunk_%02d.csv', prefix, chunk_info$id))
-          readr::write_csv(chunk_tbl, chunk_file)
+      if (length(chunk_tables_data) > 0) {
+        for (tbl in chunk_tables_data) {
+          chunk_file <- file.path(chunk_dir, sprintf('%s_chunk_%02d.csv', prefix, tbl$chunk_id[1]))
+          readr::write_csv(tbl, chunk_file)
         }
       }
     }
@@ -1372,15 +875,14 @@ execute_pipeline <- function(opts) {
       fdr = opts$fdr,
       ld_threshold = 0.75,
       prune_threshold = 99,
-      run_mode = 'ghostknockoff_only',
-      use_python_accel = opts$py_accel
+      run_mode = 'ghostknockoff_only'
     )
     chr <- unique(gwas_data$chr)[1]
     res <- process_single_locus(
       chr = chr,
       info_file = opts$info,
       gwas_data = gwas_data,
-      genotype_data = G,
+      genotype_data = geno_matrix,
       params = params,
       verbose = opts$verbose
     )
@@ -1563,7 +1065,7 @@ run_bivariate_analysis <- function(genotype_matrix, zscore_pheno1, zscore_pheno2
     
     # 只尝试LAVAKnock_bivariate，失败时直接返回NULL
     result <- tryCatch({
-      LAVAKnock_bivariate(
+      LAVAKnock::LAVAKnock_bivariate(
         Zscore_pheno1_window = zscore_pheno1,
         Zscore_pheno2_window = zscore_pheno2,
         G_window = genotype_matrix,
@@ -1633,7 +1135,7 @@ run_knockoff_filter <- function(bivariate_results, fdr = 0.1, n_knockoffs = 5,
                       bivariate_results$window.start, 
                       bivariate_results$window.end, sep = ":")
     
-    result <- LAVAKnock(
+    result <- LAVAKnock::LAVAKnock(
       M = n_knockoffs,
       p0 = p0,
       p_ko = as.matrix(p_ko),
@@ -1655,136 +1157,7 @@ run_knockoff_filter <- function(bivariate_results, fdr = 0.1, n_knockoffs = 5,
   })
 }
 
-# =============================================================================
-# 并行处理函数
-# =============================================================================
-
-#' 并行处理染色体
-process_chromosome_parallel <- function(chr, params, verbose = FALSE) {
-  
-  if (verbose) cat(paste("处理染色体", chr, "...\n"))
-  
-  # 查找染色体数据文件
-  chr_dir <- file.path(params$data_dir, paste0("chr", chr))
-  
-  if (!dir.exists(chr_dir)) {
-    warning(paste("染色体", chr, "目录不存在:", chr_dir))
-    return(NULL)
-  }
-  
-  # 获取该染色体的所有info文件
-  info_files <- list.files(chr_dir, pattern = "Info_start.*\\.csv$", full.names = TRUE)
-  
-  if (length(info_files) == 0) {
-    warning(paste("染色体", chr, "没有找到数据文件"))
-    return(NULL)
-  }
-  
-  chr_results <- list(
-    univariate_results = data.frame(),
-    bivariate_results = data.frame(),
-    knockoff_results = NULL
-  )
-  
-  # 处理每个locus文件
-  for (info_file in info_files) {
-    if (verbose) cat(paste("  处理文件:", basename(info_file), "\n"))
-    
-    # 加载变异信息
-    variant_info <- load_variant_info(info_file)
-    if (is.null(variant_info) || nrow(variant_info) == 0) next
-    
-    # 模拟或加载GWAS数据
-    if (params$use_example_data) {
-      # 使用示例数据进行测试
-      warning("使用示例数据模式，应该由测试脚本调用")
-      return(NULL)
-    } else {
-      # 实际使用时应该由调用者提供数据加载函数
-      warning("此函数应该由测试脚本调用，并传入真实数据")
-      return(NULL)
-    }
-    
-    # 准备Z-score矩阵
-    zscore_matrix <- as.matrix(gwas_data[, c("zscore_pheno1", "zscore_pheno2")])
-    rownames(zscore_matrix) <- gwas_data$rsid
-    
-    # 单变量分析
-    if (params$run_mode %in% c("full", "lavaknock_only")) {
-      locus_start <- min(variant_info$pos_bp)
-      locus_end <- max(variant_info$pos_bp)
-      
-      univ_result <- run_univariate_analysis(
-        genotype_data, zscore_matrix, chr, locus_start, locus_end,
-        params$sample_size, params$prune_threshold, verbose
-      )
-      
-      if (!is.null(univ_result)) {
-        chr_results$univariate_results <- rbind(chr_results$univariate_results, univ_result)
-      }
-    }
-    
-    # 生成knockoff并进行双变量分析
-    if (params$run_mode %in% c("full", "ghostknockoff_only")) {
-      
-      # 创建分析窗口
-      windows <- create_analysis_windows(variant_info, params$window_size, params$window_step)
-      
-      if (nrow(windows) == 0) next
-      
-      # 生成knockoff
-      knockoff_scores <- generate_ghostknockoff_scores(
-        genotype_matrix = genotype_data,
-        zscore_matrix = zscore_matrix,
-        ld_threshold = params$ld_threshold,
-        n_samples = params$sample_size,
-        n_knockoffs = params$knockoffs,
-        use_python_accel = isTRUE(params$use_python_accel),
-        verbose = verbose
-      )
-      
-      if (is.null(knockoff_scores)) next
-      
-      # 对每个窗口进行双变量分析
-      for (i in 1:nrow(windows)) {
-        window <- windows[i, ]
-        variant_indices <- window$variant_indices[[1]]
-        
-        window_genotype <- genotype_data[, variant_indices, drop = FALSE]
-        
-        # 提取窗口的knockoff分数
-        zscore_pheno1_window <- as.data.frame(knockoff_scores$pheno1[variant_indices, ])
-        zscore_pheno2_window <- as.data.frame(knockoff_scores$pheno2[variant_indices, ])
-        
-        # 双变量分析
-        bivar_result <- run_bivariate_analysis(
-          window_genotype, zscore_pheno1_window, zscore_pheno2_window,
-          chr, window$start, window$end, params$sample_size, 
-          params$prune_threshold, verbose
-        )
-        
-        if (!is.null(bivar_result)) {
-          chr_results$bivariate_results <- rbind(chr_results$bivariate_results, bivar_result)
-        }
-      }
-    }
-  }
-  
-  # 对该染色体进行knockoff过滤
-  if (nrow(chr_results$bivariate_results) > 0) {
-    chr_results$knockoff_results <- run_knockoff_filter(
-      chr_results$bivariate_results, params$fdr, params$knockoffs, 
-      verbose = verbose
-    )
-  }
-  
-  if (verbose) cat(paste("染色体", chr, "处理完成\n"))
-  return(chr_results)
-}
-
-# =============================================================================
-# 核心处理函数 - 供外部调用
-# =============================================================================
+# 核心处理函数（供外部调用）— 染色体/窗口批处理
 
 #' 处理单个染色体的单个文件
 #' @param chr 染色体编号
@@ -1799,7 +1172,7 @@ process_single_locus <- function(chr, info_file, gwas_data, genotype_data, param
   if (verbose) cat(paste("处理文件:", basename(info_file), "\n"))
   
   # 加载变异信息
-  variant_info <- load_variant_info(info_file)
+  variant_info <- as.data.frame(reticulate::py_to_r(py_env$load_variant_info(info_file)), stringsAsFactors = FALSE)
   if (is.null(variant_info) || nrow(variant_info) == 0) {
     return(NULL)
   }
@@ -1858,7 +1231,6 @@ process_single_locus <- function(chr, info_file, gwas_data, genotype_data, param
         ld_threshold = params$ld_threshold,
         n_samples = params$sample_size,
         n_knockoffs = params$knockoffs,
-        use_python_accel = isTRUE(params$use_python_accel),
         verbose = verbose
       )
       
