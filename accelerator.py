@@ -741,6 +741,26 @@ def preprocess_genotype(G: "np.ndarray") -> "np.ndarray":
     return X[:, mask]
 
 
+def qc_genotype_with_mask(G: "np.ndarray",
+                          maf_threshold: float = 0.0,
+                          mac_threshold: float = 25.0) -> Dict[str, object]:
+    """Return filtered genotype matrix along with kept SNP indices."""
+    if np is None:
+        raise RuntimeError("numpy is required for accelerator")
+    X = np.asarray(G, dtype=np.float64)
+    X = np.where((X < 0) | (X > 2) | ~np.isfinite(X), 0.0, X)
+    maf = X.mean(axis=0) / 2.0
+    mac = X.sum(axis=0)
+    var = X.var(axis=0)
+    mask = (maf > maf_threshold) & (mac >= mac_threshold) & (var > 0.0) & np.isfinite(maf)
+    indices = np.nonzero(mask)[0]
+    filtered = X[:, indices]
+    return {
+        "matrix": filtered,
+        "indices": indices
+    }
+
+
 def fast_svd_decomposition(X: "np.ndarray", variance_threshold: float = 0.99) -> Tuple["np.ndarray","np.ndarray","np.ndarray"]:
     """Compute truncated SVD such that cumulated variance >= threshold.
 

@@ -3,22 +3,21 @@
 # Pipeline 主分析流程
 # GhostKnockoff 生成与 LAVA-Knock 局部遗传相关分析
 
-# 加载基础依赖与核心 Knockoff 包
-base_libraries <- c("corpcor", "dplyr", "readr")
-suppressPackageStartupMessages(invisible(lapply(base_libraries, library, character.only = TRUE)))
-
-required_packages <- c(
-  "SKAT", "SPAtest", "CompQuadForm", "GhostKnockoff",
-  "irlba", "matrixsampling", "LAVAKnock", "snpStats"
+# 加载所需 R 包
+pipeline_packages <- c(
+  "corpcor", "dplyr", "readr",
+  "SKAT", "SPAtest", "CompQuadForm",
+  "GhostKnockoff", "irlba", "matrixsampling",
+  "LAVAKnock", "snpStats"
 )
-missing_packages <- required_packages[
-  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+missing_packages <- pipeline_packages[
+  !vapply(pipeline_packages, requireNamespace, logical(1), quietly = TRUE)
 ]
 if (length(missing_packages) > 0) {
   stop(sprintf("缺少依赖: %s。请先运行 install_packages.R", paste(missing_packages, collapse = ", ")))
 }
 
-invisible(lapply(c("GhostKnockoff", "LAVAKnock", "snpStats"), library, character.only = TRUE))
+suppressPackageStartupMessages(invisible(lapply(pipeline_packages, library, character.only = TRUE)))
 
 # 源配置脚本
 source("configure_parameters.R")
@@ -277,26 +276,24 @@ generate_ghostknockoff_scores <- function(genotype_matrix, zscore_matrix,
   
   if (verbose) cat("开始生成GhostKnockoff分数...\n")
   
-  # 数据预处理
-  genotype_matrix[genotype_matrix < 0 | genotype_matrix > 2] <- 0
-  
-  # 计算MAF和MAC
-  maf <- colMeans(genotype_matrix) / 2
-  mac <- colSums(genotype_matrix)
-  s <- colMeans(genotype_matrix^2) - colMeans(genotype_matrix)^2
-  
-  # 过滤变异
-  snp_index <- which(maf > 0 & mac >= 25 & s != 0 & !is.na(maf))
-  
-  if (length(snp_index) < 5) {
-    warning("过滤后变异数量过少")
-    return(NULL)
+  # 数据预处理与 QC（由 Python 侧完成）
+  orig_colnames <- colnames(genotype_matrix)
+  qc <- reticulate::py_to_r(py_env$qc_genotype_with_mask(genotype_matrix, maf_threshold = 0.0, mac_threshold = 25.0))
+  keep_index <- as.integer(qc$indices) + 1L
+  genotype_matrix <- qc$matrix
+  if (!is.null(orig_colnames)) {
+    colnames(genotype_matrix) <- orig_colnames[keep_index]
   }
-  
-  genotype_matrix <- genotype_matrix[, snp_index, drop = FALSE]
-  zscore_matrix <- zscore_matrix[snp_index, , drop = FALSE]
-  keep_index <- snp_index
-  
+  zscore_matrix <- zscore_matrix[keep_index, , drop = FALSE]
+  if (!is.null(variant_positions)) {
+    variant_positions <- as.numeric(variant_positions)
+    variant_positions <- variant_positions[keep_index]
+  }
+
+  if (ncol(genotype_matrix) < 5) {
+    stop("过滤后变异数量过少")
+  }
+
   # 按位置排序（优先使用提供的位置向量）
   if (!is.null(variant_positions)) {
     pos <- as.numeric(variant_positions)
@@ -307,6 +304,7 @@ generate_ghostknockoff_scores <- function(genotype_matrix, zscore_matrix,
   genotype_matrix <- genotype_matrix[, order_idx, drop = FALSE]
   zscore_matrix <- zscore_matrix[order_idx, , drop = FALSE]
   keep_index <- keep_index[order_idx]
+  variant_positions <- pos[order_idx]
   
   # LD过滤（Python实现）
   if (ncol(genotype_matrix) > 1) {
