@@ -47,7 +47,43 @@ parse_trait_option <- function(x) {
 }
 load_gene_catalog <- function(coord, base_dir = '.') {
   genes <- reticulate::py_to_r(py_env$load_gene_catalog(coord, base_dir))
-  as.data.frame(genes, stringsAsFactors = FALSE)
+  df <- as.data.frame(genes, stringsAsFactors = FALSE)
+  col_lower <- tolower(colnames(df))
+  rename_map <- c(
+    id = "id",
+    chr = "chr",
+    start = "start",
+    end = "end",
+    stop = "end",
+    stop_bp = "end",
+    pos_end = "end",
+    position_end = "end",
+    tss = "tss"
+  )
+  for (nm in names(rename_map)) {
+    idx <- which(col_lower == nm)
+    if (length(idx) == 1) {
+      colnames(df)[idx] <- rename_map[[nm]]
+      col_lower[idx] <- rename_map[[nm]]
+    }
+  }
+  if (!"id" %in% colnames(df)) {
+    df$id <- paste0("gene_", seq_len(nrow(df)))
+  }
+  if (!"end" %in% colnames(df)) {
+    stop("gene catalog 缺少 end 列")
+  }
+  df
+}
+
+infer_gene_catalog_key <- function(ld_coord_arg, default = "GRCh37") {
+  if (is.null(ld_coord_arg) || !nzchar(ld_coord_arg)) return(default)
+  upper_val <- toupper(ld_coord_arg)
+  if (upper_val %in% c("GRCH37", "GRCH38")) return(upper_val)
+  file_name <- basename(ld_coord_arg)
+  if (grepl("38|HG38|GRCH38", file_name, ignore.case = TRUE)) return("GRCh38")
+  if (grepl("37|HG19|GRCH37", file_name, ignore.case = TRUE)) return("GRCh37")
+  default
 }
 
 load_genotype_rds <- function(path) {
@@ -569,7 +605,18 @@ execute_pipeline <- function(opts) {
     stop('必须提供 --ld_coord (GRCh37, GRCh38 或自定义LD block文件路径)')
   }
 
-  gene_catalog <- load_gene_catalog(opts$ld_coord)
+  gene_catalog <- if (!is.null(opts$gene_catalog) && nzchar(opts$gene_catalog)) {
+    load_gene_catalog(opts$gene_catalog)
+  } else {
+    gene_key <- infer_gene_catalog_key(opts$ld_coord, default = "GRCh37")
+    tryCatch(
+      load_gene_catalog(gene_key),
+      error = function(e) {
+        warning(sprintf("gene catalog 加载失败 (%s)，尝试使用默认 GRCh37: %s", gene_key, e$message))
+        load_gene_catalog("GRCh37")
+      }
+    )
+  }
 
   info <- as.data.frame(reticulate::py_to_r(py_env$load_variant_info(opts$info)), stringsAsFactors = FALSE)
   if (is.null(info) || nrow(info) == 0) stop('变异信息文件读取失败或为空')

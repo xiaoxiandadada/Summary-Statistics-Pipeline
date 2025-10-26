@@ -304,22 +304,37 @@ def _build_geno_lut():
     return lut
 
 
-def _read_plink_bed(path: str, n_samples: int, n_snps: int) -> "np.ndarray":
+def _read_plink_bed_subset(path: str, n_samples: int, selected_idx: "np.ndarray") -> "np.ndarray":
     lut = _build_geno_lut()
+    selected_idx = np.asarray(selected_idx, dtype=np.int64)
+    if selected_idx.ndim != 1:
+        raise ValueError("selected_idx must be 1D array")
+    if selected_idx.size == 0:
+        return np.zeros((n_samples, 0), dtype=np.float64)
+    order = np.argsort(selected_idx)
+    selected_idx = selected_idx[order]
+    bytes_per_snp = (n_samples + 3) // 4
     with open(path, "rb") as handle:
         header = handle.read(3)
         if len(header) != 3 or header[0] != 0x6C or header[1] != 0x1B:
             raise ValueError("Invalid PLINK .bed header (magic bytes mismatch)")
         if header[2] != 0x01:
             raise ValueError("PLINK .bed must be in SNP-major mode (header byte != 1)")
-        bytes_per_snp = (n_samples + 3) // 4
-        payload = np.fromfile(handle, dtype=np.uint8)
-    expected = n_snps * bytes_per_snp
-    if payload.size != expected:
-        raise ValueError(f"Unexpected .bed payload size (expected {expected}, got {payload.size})")
-    shaped = payload.reshape((n_snps, bytes_per_snp))
-    decoded = lut[shaped].reshape(n_snps, -1)[:, :n_samples]
-    return decoded.T.copy()
+        result = np.empty((selected_idx.size, n_samples), dtype=np.float64)
+        prev_idx = -1
+        for out_pos, snp_idx in enumerate(selected_idx):
+            if snp_idx <= prev_idx:
+                raise ValueError("selected indices must be strictly increasing")
+            skip = snp_idx - prev_idx - 1
+            if skip > 0:
+                handle.seek(skip * bytes_per_snp, os.SEEK_CUR)
+            raw = np.fromfile(handle, dtype=np.uint8, count=bytes_per_snp)
+            if raw.size != bytes_per_snp:
+                raise ValueError("Unexpected EOF while reading PLINK bed")
+            decoded = lut[raw].reshape(-1)[:n_samples]
+            result[out_pos, :] = decoded
+            prev_idx = snp_idx
+    return result.T[:, order]
 
 
 def load_genotype_rds(path: str):  # pragma: no cover (handled in R)
@@ -391,7 +406,7 @@ def load_genotype_plink(path_prefix: str, snp_ids=None, chrpos_ids=None):
     if selected_idx.size == 0:
         raise ValueError("No variants selected from PLINK files")
 
-    genotype_matrix = _read_plink_bed(bed_path, n_samples, n_snps_total)[:, selected_idx]
+    genotype_matrix = _read_plink_bed_subset(bed_path, n_samples, selected_idx)
 
     col_means = np.nanmean(genotype_matrix, axis=0)
     nan_r, nan_c = np.where(np.isnan(genotype_matrix))
@@ -478,7 +493,7 @@ def auto_prepare_inputs(zscore_path: str, panel_prefix: str, trait_cols=None, ve
 
     bim_path = f"{panel_prefix}.bim"
     bim_cols = ['CHR', 'RSID', 'CM', 'POS', 'A1', 'A2']
-    bim_df = pd.read_csv(bim_path, sep='\s+', names=bim_cols)
+    bim_df = pd.read_csv(bim_path, sep=r'\s+', names=bim_cols)
     bim_df['CHR'] = _canon_chr(bim_df['CHR'])
     bim_df['POS'] = _canon_pos(bim_df['POS'])
 
@@ -559,12 +574,31 @@ def load_gene_catalog(coord_version: str, base_dir: str = "."):
             raise FileNotFoundError(f"Cannot locate gene catalog file: {filename}")
     df = pd.read_csv(path, sep=None, engine='python')
     lower = {c.lower(): c for c in df.columns}
-    required = ['id', 'chr', 'start', 'end']
-    missing = [col for col in required if col not in lower]
-    if missing:
-        raise ValueError(f"gene catalog missing required columns: {missing}")
-    df = df.rename(columns={lower['id']: 'id', lower['chr']: 'chr',
-                            lower['start']: 'start', lower['end']: 'end'})
+    rename_map = {
+        'id': 'id',
+        'gene_id': 'id',
+        'symbol': 'id',
+        'gene': 'id',
+        'chr': 'chr',
+        'chrom': 'chr',
+        'chromosome': 'chr',
+        'start': 'start',
+        'start_bp': 'start',
+        'position': 'start',
+        'end': 'end',
+        'stop': 'end',
+        'stop_bp': 'end'
+    }
+    renamed = {}
+    for key, target in rename_map.items():
+        if key in lower and target not in renamed:
+            renamed[target] = lower[key]
+    df = df.rename(columns={orig: target for target, orig in renamed.items()})
+    if 'id' not in df.columns:
+        df['id'] = [f"gene_{i}" for i in range(1, len(df) + 1)]
+    for col in ['chr', 'start', 'end']:
+        if col not in df.columns:
+            raise ValueError(f"gene catalog missing required column '{col}'")
     df['chr'] = df['chr'].astype(str).str.replace('^chr', '', regex=True, case=False)
     df['chr'] = pd.to_numeric(df['chr'], errors='coerce')
     df['start'] = pd.to_numeric(df['start'], errors='coerce')

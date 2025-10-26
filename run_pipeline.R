@@ -1,6 +1,19 @@
 #!/usr/bin/env Rscript
 
-# 入口脚本：解析命令行，并将计算委托给 summary_pipeline.R
+# # 入口脚本：解析命令行，并将计算委托给 summary_pipeline.R
+# Sys.setenv(
+#   RETICULATE_USE_UV = "0",
+#   RETICULATE_DISABLE_AUTOCONFIGURE = "1",
+#   RETICULATE_PYTHON = file.path(Sys.getenv("CONDA_PREFIX", ""), "bin", "python")
+# )
+# suppressMessages(library(reticulate))
+# if (nzchar(Sys.getenv("RETICULATE_PYTHON"))) {
+#   use_python(Sys.getenv("RETICULATE_PYTHON"), required = TRUE)
+# } else {
+#   use_condaenv("R", required = TRUE)
+# }
+
+# py_config()
 
 suppressPackageStartupMessages({
   if (!requireNamespace('optparse', quietly = TRUE)) {
@@ -54,6 +67,8 @@ opt_list <- list(
               help = '参考面板PLINK前缀(默认使用内置的 g1000_eur)', metavar = 'PREFIX'),
   make_option(c('--ld_coord'), type = 'character', default = NULL,
               help = '必填: 指定LD block坐标版本 (GRCh37 或 GRCh38)', metavar = 'STR'),
+  make_option(c('--gene_catalog'), type = 'character', default = NULL,
+              help = '自定义基因注释文件 (可选)', metavar = 'FILE'),
   make_option(c('-Z', '--zscore'), type = 'character', default = NULL,
               help = '单表型或多表型zscore文件 (列: CHR POS Z 或 rsid + 数值列)', metavar = 'FILE'),
   make_option(c('-T', '--zscore_traits'), type = 'character', default = NULL,
