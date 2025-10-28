@@ -14,19 +14,40 @@
 ### 1) 安装依赖
 
 ```bash
-Rscript install_packages.R
+# 默认自动检测 Python；如需指定解释器，可追加 --python
+Rscript install_packages.R --python /path/to/python
 ```
+
+> 如果 reticulate 仍提示缺少 pandas，请确认在同一个 Python 环境中执行 `pip install pandas`，或使用 `--python` 参数指定已安装 pandas 的解释器。
+
+如果想在 Conda 中一次性封装 Python 依赖，可使用仓库提供的 `conda_env_summary_pipeline.txt`：
+
+```bash
+conda create --name summary-pipeline --file conda_env_summary_pipeline.txt
+conda activate summary-pipeline
+export RETICULATE_PYTHON=$(which python)
+Rscript install_packages.R --python "$RETICULATE_PYTHON"
+```
+
+上述步骤会安装 `numpy/numba/pandas` 等 Python 依赖，并保证 reticulate 指向该环境。随后即可执行下面的命令运行 pipeline。
 
 ### 2) 变量选择（参考面板 + 自动切块）
 
 ```bash
-Rscript run_pipeline.R --mode select   --zscore zscore_GRCh37.txt   --panel g1000_eur   --ld_coord GRCh37   -v -o results
+Rscript run_pipeline.R --mode select \
+  --zscore zscore_GRCh37.txt \
+  --panel g1000_eur \
+  --ld_coord GRCh37 \
+  --knockoffs 5 \
+  --fdr 0.1 \
+  -v -o results
 ```
 
 - 自动解析 `zscore.txt` 中的 `chr:pos:ref:alt` 或 `CHR/POS` 列，与参考面板按 `CHR+POS` 匹配。
 - `--panel` 可省略（默认 `g1000_eur/g1000_eur`）。
 - `--ld_coord` 必须显式指定 LD block 坐标，可填 `GRCh37`/`GRCh38` 或自定义 block 文件路径。
 - `--threads`（可选）指定 Python 分块线程数；缺省值为可用 CPU 数。
+- `--gene_catalog`（可选）自定义基因注释表，需包含列 `id/chr/start/end`；未提供时会根据 `--ld_coord` 自动选择 GRCh37/GRCh38。
 
 ### 3) 变量选择（真实基因型）
 
@@ -61,6 +82,8 @@ Rscript run_pipeline.R --mode select --zscore test/zscore_demo.tsv --geno_plink 
 ```bash
 Rscript run_pipeline.R --mode correl   --zscore zscore.txt   --panel g1000_eur/g1000_eur   -v -o results
 ```
+
+
 
 > 扩展到全基因组时，可对 1–22 号染色体循环运行（如需特定窗口，可继续使用 `scripts/build_info_from_plink.R` 手动生成 Info）。
 
