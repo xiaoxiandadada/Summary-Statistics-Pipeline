@@ -6,19 +6,19 @@ Functions are designed to be imported from R via:
   reticulate::source_python('accelerator.py')
 
 Provided capabilities:
-- fast_correlation_matrix: Numba/NumPy accelerated correlation
-- ld_pruning: greedy LD pruning on absolute correlation
-- preprocess_genotype: QC and filter genotype matrix
-- fast_svd_decomposition: truncated SVD by variance threshold
-- compute_window_statistics: per-window univariate/bivariate stats
-- knockoff_filter_fast: fast knockoff filter (W, threshold, selection)
-- parallel_window_analysis: parallel per-window processing (optional)
+- fast_correlation_matrix / ld_pruning: LD-aware filtering with Numba acceleration
+- load_genotype_plink / load_genotype_csv: streaming genotype ingest and harmonisation
+- auto_prepare_inputs / load_variant_info: align zscore files to reference panels
+- partition_ld_blocks: chromosome-wise LD block partition planner (threaded)
+- qc_genotype_with_mask / preprocess_genotype: GWAS-style QC helpers
+- annotate_nearest_gene: nearest-gene lookup for significant variants
+- compute_window_statistics / knockoff_filter_fast: window-level stats + knockoff FDR
 """
 
 import csv
 import os
 import warnings
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import numpy as np
@@ -246,9 +246,6 @@ def partition_ld_blocks(
                 results_fallback.extend(fallback_list)
     return {'chunks': results_chunks, 'fallback': results_fallback}
 
-
-# %% MARK: Genotype loaders (R wraps these via reticulate)
-
 _GENO_LUT = None
 
 
@@ -395,8 +392,6 @@ def load_genotype_plink(path_prefix: str, snp_ids=None, chrpos_ids=None):
         'rsid': rsid_out,
     }
 
-
-# %% MARK: Variant / GWAS preparation
 
 
 def load_variant_info(path: str):
@@ -709,8 +704,6 @@ def align_genotype_to_gwas(
     }
 
 
-# %% MARK: Additional utilities
-
 
 def preprocess_genotype(G: np.ndarray) -> np.ndarray:
     """QC filter genotype matrix (samples×SNPs).
@@ -914,39 +907,3 @@ def compute_knockoff_threshold(kappa: np.ndarray, tau: np.ndarray, M: int, fdr: 
     if idx.size > 0:
         return float(tau[order[idx[-1]]])
     return float('inf')
-
-
-def parallel_window_analysis(
-    genotype_data: np.ndarray,
-    zscore_df,
-    windows_df,
-    window_size: int = 100000,
-    n_samples: int = 20000,
-) -> list[dict]:
-    """Parallel window analysis. Windows dataframe must have columns ['start','end'].
-    zscore_df must have at least columns ['pos','zscore_pheno1','zscore_pheno2'] and be index-aligned to genotype columns.
-    """
-
-    def _analyze(args):
-        widx, wstart, wend = args
-        mask = (zscore_df['pos'] >= wstart) & (zscore_df['pos'] <= wend)
-        idx = np.where(mask.values)[0]
-        if idx.size < 5:
-            return None
-        Gwin = genotype_data[:, idx]
-        Zwin = zscore_df.loc[mask, ['zscore_pheno1', 'zscore_pheno2']].values
-        res = compute_window_statistics(Gwin, Zwin, n_samples)
-        res.update(
-            {
-                'window_idx': int(widx),
-                'window_start': int(wstart),
-                'window_end': int(wend),
-                'n_variants': int(idx.size),
-            }
-        )
-        return res
-
-    args_iter = [(i, int(w['start']), int(w['end'])) for i, w in windows_df.iterrows()]
-    with ProcessPoolExecutor() as ex:
-        out = list(ex.map(_analyze, args_iter))
-    return [r for r in out if r is not None]
