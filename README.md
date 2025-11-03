@@ -25,7 +25,6 @@ Rscript run_pipeline.R --mode select \
   --zscore test/zscore_demo.tsv \
   --panel test/demo_chr10 \
   --ld_coord GRCh37 \
-  --plot_manhattan \
   -o results/select_demo -v
 ```
 
@@ -39,7 +38,6 @@ Rscript run_pipeline.R --mode correl \
   --panel test/demo_chr10 \
   --ld_coord GRCh37 \
   --win 5000000 --step 5000000 \
-  --plot_manhattan \
   -o results/correl_demo -v
 ```
 
@@ -57,7 +55,7 @@ Rscript run_pipeline.R --mode correl \
 
 字段示例：`id, pval.orginal, pval.knockoff*, W, Qvalue, selected, leading_source, nearest_gene`。
 
-> 如需自动生成曼哈顿图，可在命令中添加 `--plot_manhattan`（需确保仓库根目录存在 `plotting.R`）。
+自动会生成 `*_manhattan.png`（需确保根目录存在 `plotting.R`）。
 
 ## 目录速览
 ```

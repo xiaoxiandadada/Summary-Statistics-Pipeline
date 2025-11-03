@@ -109,7 +109,7 @@ install_lavaknock <- function() {
   }
 }
 
-install_python_packages <- function(packages = c("numpy", "numba"), envname = NULL, method = "auto") {
+install_python_packages <- function(packages = c("numpy", "numba", "pandas"), envname = NULL, method = "auto") {
   if (length(packages) == 0) return(invisible())
   if (!requireNamespace("reticulate", quietly = TRUE)) {
     message_line("⚠️  reticulate 未安装，跳过 Python 依赖自动安装")
@@ -142,6 +142,24 @@ main <- function() {
   message_line("Installing packages for GhostKnockoff + LAVA-Knock pipeline")
   message_line("============================================================")
 
+  args <- commandArgs(trailingOnly = TRUE)
+  python_path <- NULL
+  envname <- NULL
+  for (arg in args) {
+    if (grepl("^--python=", arg)) python_path <- sub("^--python=", "", arg)
+    if (grepl("^--envname=", arg)) envname <- sub("^--envname=", "", arg)
+  }
+
+  if (!is.null(python_path) && nzchar(python_path)) {
+    Sys.setenv(RETICULATE_PYTHON = python_path)
+    message_line("Using RETICULATE_PYTHON = ", python_path)
+  } else {
+    message_line("RETICULATE_PYTHON not provided; reticulate will auto-detect.")
+  }
+  if (!is.null(envname) && nzchar(envname)) {
+    message_line("reticulate envname: ", envname)
+  }
+
   cran_core <- c(
     # base utilities
     "Matrix", "MASS", "corpcor", "parallel", "doParallel", "foreach",
@@ -160,16 +178,25 @@ main <- function() {
     "devtools"
   )
 
+  message_line("\n==> Installing CRAN packages")
   install_if_missing(cran_core)
 
   bioc_core <- c("snpStats", "graph", "MatrixGenerics")
+  message_line("\n==> Installing Bioconductor packages")
   install_bioc_if_missing(bioc_core, bioc_version = "3.17")
 
   # Attempt GitHub-only dependency
+  message_line("\n==> Installing GitHub packages")
   install_lavaknock()
 
   # Optional Python acceleration dependencies
-  install_python_packages(packages = c("numpy", "numba"))
+  message_line("\n==> Installing Python packages via reticulate")
+  install_python_packages(packages = c("numpy", "numba", "pandas"), envname = envname)
+
+  if (requireNamespace("reticulate", quietly = TRUE)) {
+    message_line("\nPython configuration summary:")
+    print(tryCatch(reticulate::py_config(), error = identity))
+  }
 
   # Final check summary
   pkgs_to_check <- c(cran_core, bioc_core, "LAVAKnock")
