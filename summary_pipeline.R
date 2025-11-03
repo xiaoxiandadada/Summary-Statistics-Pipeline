@@ -20,10 +20,7 @@ if (length(missing_packages) > 0) {
 
 suppressPackageStartupMessages(invisible(lapply(pipeline_packages, library, character.only = TRUE)))
 
-# 源配置脚本
-source("configure_parameters.R")
-
-# Python 加速（直接从 accelerator.py 载入，可选）
+# Python 加速（直接从 accelerator.py 载入）
 py_env <- new.env(parent = emptyenv())
 py_ok <- FALSE
 if (requireNamespace("reticulate", quietly = TRUE)) {
@@ -175,6 +172,121 @@ align_genotype_to_gwas <- function(geno_matrix, gwas_df, prefer_rsid = TRUE) {
   )
 }
 
+merge_gwas_with_info <- function(info_df, gwas_df) {
+  if (is.null(gwas_df)) return(NULL)
+  if (!all(c("CHR", "POS", "Z") %in% names(gwas_df))) {
+    stop("GWAS 文件缺少 CHR/POS/Z 列")
+  }
+  gwas_df <- gwas_df[!is.na(gwas_df$CHR) & !is.na(gwas_df$POS), , drop = FALSE]
+  gwas_df$CHR <- as.integer(gwas_df$CHR)
+  gwas_df$POS <- as.numeric(gwas_df$POS)
+  gwas_df$Z <- as.numeric(gwas_df$Z)
+  gwas_df <- gwas_df[!is.na(gwas_df$Z), , drop = FALSE]
+  if (nrow(gwas_df) == 0) return(NULL)
+
+  merged <- merge(
+    info_df,
+    gwas_df,
+    by.x = c("chr", "pos_bp"),
+    by.y = c("CHR", "POS"),
+    all = FALSE,
+    sort = FALSE
+  )
+
+  if ("rsid.x" %in% names(merged) || "rsid.y" %in% names(merged)) {
+    rsid_x <- if ("rsid.x" %in% names(merged)) merged$rsid.x else NA_character_
+    rsid_y <- if ("rsid.y" %in% names(merged)) merged$rsid.y else NA_character_
+    merged$rsid <- ifelse(!is.na(rsid_x) & nzchar(rsid_x), rsid_x, rsid_y)
+    merged$rsid.x <- NULL
+    merged$rsid.y <- NULL
+  }
+
+  merged$Z <- as.numeric(merged$Z)
+  merged[!is.na(merged$Z), , drop = FALSE]
+}
+
+align_dual_traits <- function(primary_df, secondary_df = NULL, verbose = FALSE) {
+  if (is.null(primary_df) || nrow(primary_df) == 0) {
+    stop("主表型数据为空")
+  }
+
+  if (is.null(secondary_df) || nrow(secondary_df) == 0) {
+    primary_df$zscore_pheno1 <- as.numeric(primary_df$Z)
+    primary_df$zscore_pheno2 <- NA_real_
+    primary_df$Z <- NULL
+    return(primary_df)
+  }
+
+  key1 <- paste0(primary_df$chr, ":", primary_df$pos_bp)
+  key2 <- paste0(secondary_df$chr, ":", secondary_df$pos_bp)
+  common_keys <- intersect(key1, key2)
+  if (length(common_keys) == 0) {
+    stop("两个表型之间没有共享的变异 (chr:pos)")
+  }
+
+  idx1 <- match(common_keys, key1)
+  idx2 <- match(common_keys, key2)
+
+  aligned <- primary_df[idx1, , drop = FALSE]
+  aligned$zscore_pheno1 <- as.numeric(aligned$Z)
+  aligned$zscore_pheno2 <- as.numeric(secondary_df$Z[idx2])
+  aligned$Z <- NULL
+
+  aligned <- aligned[!is.na(aligned$zscore_pheno1) & !is.na(aligned$zscore_pheno2), , drop = FALSE]
+
+  if (verbose) {
+    cat(sprintf("Dual trait alignment: kept %d shared variants\n", nrow(aligned)))
+  }
+
+  aligned
+}
+
+align_positions_with_info <- function(variant_ids, variant_info, fallback_positions = NULL) {
+  if (is.null(variant_info) || nrow(variant_info) == 0) {
+    return(if (is.null(fallback_positions)) rep(NA_real_, length(variant_ids)) else fallback_positions)
+  }
+
+  key <- NULL
+  if ("rsid" %in% names(variant_info)) {
+    key <- as.character(variant_info$rsid)
+  } else {
+    chr_col <- if ("chr" %in% names(variant_info)) variant_info$chr else variant_info[[which(grepl("^chr$", names(variant_info), ignore.case = TRUE))[1]]]
+    pos_col <- NULL
+    if ("pos_bp" %in% names(variant_info)) {
+      pos_col <- variant_info$pos_bp
+    } else {
+      pos_idx <- which(grepl("pos", names(variant_info), ignore.case = TRUE))
+      if (length(pos_idx) > 0) pos_col <- variant_info[[pos_idx[1]]]
+    }
+    if (!is.null(chr_col) && !is.null(pos_col)) {
+      key <- paste0(chr_col, ":", pos_col)
+    }
+  }
+
+  pos_values <- NULL
+  if ("pos_bp" %in% names(variant_info)) {
+    pos_values <- as.numeric(variant_info$pos_bp)
+  } else {
+    pos_idx <- which(grepl("pos", names(variant_info), ignore.case = TRUE))
+    if (length(pos_idx) > 0) pos_values <- as.numeric(variant_info[[pos_idx[1]]])
+  }
+
+  aligned <- rep(NA_real_, length(variant_ids))
+  if (!is.null(key) && !is.null(pos_values)) {
+    match_idx <- match(variant_ids, key)
+    take <- !is.na(match_idx)
+    if (any(take)) {
+      aligned[take] <- pos_values[match_idx[take]]
+    }
+  }
+
+  if (!is.null(fallback_positions)) {
+    aligned[is.na(aligned)] <- fallback_positions[is.na(aligned)]
+  }
+
+  aligned
+}
+
 parse_trait_option <- function(x) {
   if (is.null(x) || is.na(x) || x == '') return(NULL)
   trimws(unlist(strsplit(x, ',')))
@@ -219,9 +331,9 @@ create_analysis_windows <- function(variant_info, window_size = 100000, window_s
     return(data.frame())
   }
 
-  # 移除NA值
-  valid_indices <- !is.na(positions)
-  if (sum(valid_indices) == 0) {
+  # 移除NA值，同时保留原始行索引
+  valid_indices <- which(!is.na(positions))
+  if (length(valid_indices) == 0) {
     warning("所有位置信息都是NA")
     return(data.frame())
   }
@@ -237,16 +349,17 @@ create_analysis_windows <- function(variant_info, window_size = 100000, window_s
     end_pos <- start_pos + window_size - 1
 
     # 检查窗口内是否有变异
-    variants_in_window <- which(positions >= start_pos & positions <= end_pos)
+    idx_in_window <- which(positions >= start_pos & positions <= end_pos)
 
-    if (length(variants_in_window) >= 5) {  # 至少5个变异
+    if (length(idx_in_window) >= 5) {  # 至少5个变异
+      original_rows <- valid_indices[idx_in_window]
       windows <- rbind(windows, data.frame(
         window_id = window_id,
         chr = chr,
         start = start_pos,
         end = end_pos,
-        n_variants = length(variants_in_window),
-        variant_indices = I(list(variants_in_window))
+        n_variants = length(original_rows),
+        variant_indices = I(list(original_rows))
       ))
       window_id <- window_id + 1
     }
@@ -361,14 +474,37 @@ run_univariate_analysis <- function(genotype_matrix, zscore_matrix,
 
   if (verbose) cat("运行单变量遗传性分析...\n")
 
+  G <- as.matrix(genotype_matrix)
+  if (nrow(G) < 2 || ncol(G) < 2) {
+    if (verbose) message("跳过单变量分析: 有效样本或变异数量不足")
+    return(NULL)
+  }
+
+  Z <- as.matrix(zscore_matrix)
+  if (nrow(Z) != ncol(G)) {
+    stop("单变量分析失败: Zscore行数与基因型变异数量不一致")
+  }
+
+  effective_n <- n_samples
+  geno_n <- nrow(G)
+  if (!is.na(geno_n) && geno_n > 1 && geno_n != n_samples) {
+    if (verbose) {
+      message(sprintf(
+        "  注意: 提供的样本量(n=%s)与基因型行数(n=%s)不一致，单变量分析将使用后者以匹配矩阵维度",
+        n_samples, geno_n
+      ))
+    }
+    effective_n <- geno_n
+  }
+
   tryCatch({
     result <- LAVAKnock::LAVAKnock_univariate(
-      Zscore = zscore_matrix,
-      G_locus = genotype_matrix,
+      Zscore = Z,
+      G_locus = G,
       chr = chr,
       locus_start = locus_start,
       locus_end = locus_end,
-      n = n_samples,
+      n = effective_n,
       prune.thresh = prune_thresh
     )
 
@@ -461,27 +597,37 @@ run_ghostknockoff_selection <- function(genotype_matrix, z_vector,
     variant_ids <- variant_ids[seq_len(nrow(scores))]
   }
 
-  # 使用LAVAKnock进行FDR控制的选择
-  res <- LAVAKnock::LAVAKnock(
-    M = n_knockoffs,
-    p0 = p0,
-    p_ko = as.matrix(pko),
-    fdr = fdr,
-    window_id = variant_ids,
-    Rej.Bound = max(20000, length(p0))
+  knock_cols <- paste0("knock", seq_len(n_knockoffs))
+  T0 <- abs(scores$org)
+  Tk <- abs(as.matrix(scores[, knock_cols, drop = FALSE]))
+
+  filter_res <- GhostKnockoff::GhostKnockoff.filter(T0, Tk)
+  q_vals <- as.numeric(filter_res$q)
+  tau_vals <- as.numeric(filter_res$tau)
+  kappa_vals <- as.integer(filter_res$kappa)
+
+  selected_flag <- !is.na(q_vals) & q_vals <= fdr
+  threshold_val <- if (any(selected_flag, na.rm = TRUE)) {
+    min(tau_vals[selected_flag], na.rm = TRUE)
+  } else {
+    NA_real_
+  }
+
+  leading_source <- ifelse(
+    is.na(kappa_vals) | kappa_vals == 0,
+    "original",
+    paste0("knock", kappa_vals)
   )
 
-  threshold_val <- if (!is.null(res$W.threshold)) as.numeric(res$W.threshold) else NA_real_
-
-  # 汇总为结果表
   out_tbl <- data.frame(
     id = variant_ids,
     pval.orginal = p0,
     pko,
-    W = res$W,
-    Qvalue = res$Qvalue,
-    selected = res$W >= res$W.threshold,
+    W = tau_vals,
+    Qvalue = q_vals,
+    selected = selected_flag,
     W_threshold = threshold_val,
+    leading_source = leading_source,
     stringsAsFactors = FALSE
   )
 
@@ -491,117 +637,12 @@ run_ghostknockoff_selection <- function(genotype_matrix, z_vector,
 
   list(
     pvals = list(p0 = p0, pko = pko),
-    lavaknock = res,
+    filter = filter_res,
     table = out_tbl,
     threshold = threshold_val
   )
 }
 
-plot_manhattan_w <- function(df, out_path, title = 'Manhattan plot (W statistic)', threshold = NULL) {
-  df <- df[!is.na(df$chr) & !is.na(df$pos) & !is.na(df$W), , drop = FALSE]
-  if (nrow(df) == 0) return(invisible())
-  df <- df[order(df$chr, df$pos), , drop = FALSE]
-
-  df$CHR <- as.integer(df$chr)
-  df$BP <- as.numeric(df$pos)
-  df$SNP <- ifelse(!is.na(df$id) & nzchar(df$id), df$id, paste0(df$CHR, ':', df$BP))
-  if ('W_threshold' %in% colnames(df) && (is.null(threshold) || length(threshold) == 0)) {
-    thr_candidates <- unique(stats::na.omit(df$W_threshold))
-    if (length(thr_candidates) > 0) {
-      threshold <- max(thr_candidates)
-    }
-  }
-
-  colors <- c('#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b')
-  highlight_color <- '#e41a1c'
-
-  chr_levels <- sort(unique(df$CHR))
-  df$color <- colors[(match(df$CHR, chr_levels) - 1) %% length(colors) + 1]
-  df$cum_pos <- rep(NA_real_, nrow(df))
-  tick_pos <- numeric(length(chr_levels))
-  cumulative <- 0
-  for (i in seq_along(chr_levels)) {
-    chr_val <- chr_levels[i]
-    idx <- which(df$CHR == chr_val)
-    if (length(idx) == 0) next
-    df$cum_pos[idx] <- df$BP[idx] + cumulative
-    tick_pos[i] <- cumulative + stats::median(df$BP[idx])
-    cumulative <- cumulative + max(df$BP[idx])
-  }
-
-  y_vals <- df$W
-  if (!is.null(threshold) && length(threshold) > 0 && is.finite(threshold)) {
-    y_vals <- c(y_vals, threshold)
-  }
-  y_lim <- range(y_vals, finite = TRUE)
-  y_pad <- diff(y_lim)
-  if (!is.finite(y_pad) || y_pad == 0) y_pad <- abs(y_lim[1]) * 0.1 + 1
-  y_lim[1] <- y_lim[1] - 0.05 * y_pad
-  y_lim[2] <- y_lim[2] + 0.05 * y_pad
-
-  png(out_path, width = 1600, height = 600)
-  old_par <- par(no.readonly = TRUE)
-  on.exit({par(old_par); dev.off()}, add = TRUE)
-  par(mar = c(5, 5, 3, 1))
-
-  plot(
-    df$cum_pos, df$W,
-    col = df$color, pch = 16, cex = 1.1,
-    xaxt = 'n', xlab = 'Chromosome', ylab = 'W statistic',
-    main = title, cex.axis = 1.2, cex.lab = 1.4, cex.main = 1.6,
-    las = 1, font.main = 2, font.lab = 2, ylim = y_lim
-  )
-  axis(1, at = tick_pos, labels = chr_levels, cex.axis = 1.2)
-  axis(2, las = 1, cex.axis = 1.2)
-  box()
-
-  highlight_idx <- which(df$selected %in% TRUE)
-  if (length(highlight_idx) > 0) {
-    points(df$cum_pos[highlight_idx], df$W[highlight_idx],
-           col = highlight_color, pch = 16, cex = 1.3)
-  }
-
-  thr_line <- NULL
-  if (!is.null(threshold) && length(threshold) > 0 && is.finite(threshold)) {
-    thr_line <- as.numeric(threshold[1])
-    abline(h = thr_line, col = highlight_color, lwd = 2, lty = 2)
-  }
-
-  legend_entries <- character()
-  legend_cols <- character()
-  legend_pch <- numeric()
-  legend_lty <- numeric()
-  legend_lwd <- numeric()
-
-  if (length(highlight_idx) > 0) {
-    legend_entries <- c(legend_entries, 'Selected variants')
-    legend_cols <- c(legend_cols, highlight_color)
-    legend_pch <- c(legend_pch, 16)
-    legend_lty <- c(legend_lty, NA)
-    legend_lwd <- c(legend_lwd, NA)
-  }
-
-  if (!is.null(thr_line)) {
-    legend_entries <- c(legend_entries, sprintf('Threshold (W = %.3f)', thr_line))
-    legend_cols <- c(legend_cols, highlight_color)
-    legend_pch <- c(legend_pch, NA)
-    legend_lty <- c(legend_lty, 2)
-    legend_lwd <- c(legend_lwd, 2)
-  }
-
-  if (length(legend_entries) > 0) {
-    legend('topright',
-           legend = legend_entries,
-           col = legend_cols,
-           pch = legend_pch,
-           lty = legend_lty,
-           lwd = legend_lwd,
-           bty = 'n',
-           cex = 1.0)
-  }
-
-  invisible()
-}
 
 # 核心处理函数（供外部调用）— 染色体/窗口批处理
 
@@ -647,14 +688,40 @@ process_single_locus <- function(chr, info_file, gwas_data, genotype_data, param
   z_mat <- as.matrix(gwas_data[idx[keep], c("zscore_pheno1", "zscore_pheno2")])
   rownames(z_mat) <- colnames(genotype_data)
 
+  lava_sample_n <- nrow(genotype_data)
+  if (!is.null(params$sample_size) && !is.na(params$sample_size) &&
+      params$sample_size != lava_sample_n) {
+    if (verbose) {
+      message(sprintf(
+        "样本量提醒: GWAS 提供 n=%s, 基因型行数 n=%s；LAVAKnock 将使用后者以避免矩阵维度不一致 (GhostKnockoff 仍使用 n=%s)",
+        params$sample_size, lava_sample_n, params$sample_size
+      ))
+    }
+  }
+
+  v_ids <- paste0(variant_info$chr, ":", variant_info$pos_bp)
+  matched_rows <- match(colnames(genotype_data), v_ids)
+  matched_rows <- matched_rows[!is.na(matched_rows)]
+  if (length(matched_rows) != ncol(genotype_data)) {
+    stop('变异信息与基因型列无法一一匹配')
+  }
+  variant_info <- variant_info[matched_rows, , drop = FALSE]
+  variant_pos_all <- if ("pos_bp" %in% colnames(variant_info)) {
+    variant_info$pos_bp
+  } else if ("pos" %in% colnames(variant_info)) {
+    variant_info$pos
+  } else {
+    variant_info[[which(grepl('pos', names(variant_info), ignore.case = TRUE))[1]]]
+  }
+
   # 单变量分析
   if (params$run_mode %in% c("full", "lavaknock_only")) {
-    locus_start <- min(variant_info$pos_bp)
-    locus_end <- max(variant_info$pos_bp)
+    locus_start <- min(variant_pos_all, na.rm = TRUE)
+    locus_end <- max(variant_pos_all, na.rm = TRUE)
 
     univ_result <- run_univariate_analysis(
       genotype_data, z_mat, chr, locus_start, locus_end,
-      params$sample_size, params$prune_threshold, verbose
+      lava_sample_n, params$prune_threshold, verbose
     )
 
     if (!is.null(univ_result)) {
@@ -670,64 +737,104 @@ process_single_locus <- function(chr, info_file, gwas_data, genotype_data, param
 
     if (nrow(windows) > 0) {
 
-      # 生成knockoff（记录选择后的索引以便窗口映射）
-      knockoff_scores <- generate_ghostknockoff_scores(
-        genotype_matrix = genotype_data,
-        zscore_matrix = z_mat,
-        ld_threshold = params$ld_threshold,
-        n_samples = params$sample_size,
-        n_knockoffs = params$knockoffs,
-        verbose = verbose
-      )
+      window_variants <- lapply(windows$variant_indices, function(x) {
+        if (is.list(x)) as.integer(x[[1]]) else as.integer(x)
+      })
 
-      if (!is.null(knockoff_scores)) {
+      window_results <- data.frame()
+      result_list <- vector("list", length = nrow(windows))
 
-        # 对每个窗口进行双变量分析
-        window_results <- data.frame()
+      for (w_idx in seq_len(nrow(windows))) {
+        window_cols <- window_variants[[w_idx]]
+        window_cols <- window_cols[window_cols %in% seq_len(ncol(genotype_data))]
+        if (length(window_cols) < 5) next
 
-        # 为variant_info构建至基因型列的索引映射
-        v_ids <- paste0(variant_info$chr, ":", variant_info$pos_bp)
-        map_idx <- match(v_ids, colnames(genotype_data))
-        for (i in seq_len(nrow(windows))) {
-          window <- windows[i, ]
-          variant_indices <- window$variant_indices[[1]]
-          geno_indices <- map_idx[variant_indices]
-          geno_indices <- geno_indices[!is.na(geno_indices)]
-          if (length(geno_indices) < 2) next
-          window_genotype <- genotype_data[, geno_indices, drop = FALSE]
+        sub_geno <- genotype_data[, window_cols, drop = FALSE]
+        sub_z <- z_mat[window_cols, , drop = FALSE]
 
-          # 将基因型列索引映射到GhostKnockoff选择后的索引空间
-          if (is.null(knockoff_scores$index)) {
-            stop("GhostKnockoff返回缺少index映射，无法对齐窗口Z-scores")
-          }
-          ko_idx <- match(geno_indices, knockoff_scores$index)
-          ko_idx <- ko_idx[!is.na(ko_idx)]
-          if (length(ko_idx) < 2) next
-          # 提取窗口的knockoff分数（使用映射后的行索引）
-          zscore_pheno1_window <- as.data.frame(knockoff_scores$pheno1[ko_idx, ])
-          zscore_pheno2_window <- as.data.frame(knockoff_scores$pheno2[ko_idx, ])
+        knockoff_scores <- generate_ghostknockoff_scores(
+          genotype_matrix = sub_geno,
+          zscore_matrix = sub_z,
+          ld_threshold = params$ld_threshold,
+          n_samples = params$sample_size,
+          n_knockoffs = params$knockoffs,
+          variant_positions = variant_pos_all[window_cols],
+          verbose = verbose
+        )
 
-          # 双变量分析
-          bivar_result <- run_bivariate_analysis(
-            window_genotype, zscore_pheno1_window, zscore_pheno2_window,
-            chr, window$start, window$end, params$sample_size,
-            params$prune_threshold, verbose
-          )
+        if (is.null(knockoff_scores) || is.null(knockoff_scores$index)) next
 
-          if (!is.null(bivar_result)) {
-            window_results <- rbind(window_results, bivar_result)
-          }
+        ko_idx <- as.integer(knockoff_scores$index)
+        ko_idx <- ko_idx[ko_idx >= 1 & ko_idx <= ncol(sub_geno)]
+        if (length(ko_idx) < 2) next
+
+        window_genotype <- sub_geno[, ko_idx, drop = FALSE]
+        zscore_pheno1_window <- knockoff_scores$pheno1
+        zscore_pheno2_window <- knockoff_scores$pheno2
+
+        window <- windows[w_idx, ]
+
+        bivar_result <- run_bivariate_analysis(
+          window_genotype,
+          zscore_pheno1_window,
+          zscore_pheno2_window,
+          chr = window$chr,
+          window_start = window$start,
+          window_end = window$end,
+          n_samples = lava_sample_n,
+          prune_thresh = params$prune_threshold,
+          verbose = verbose
+        )
+
+        if (!is.null(bivar_result)) {
+          result_list[[w_idx]] <- bivar_result
         }
+      }
+
+      result_list <- Filter(Negate(is.null), result_list)
+
+      if (length(result_list) > 0) {
+        window_results <- do.call(rbind, result_list)
+        results$knockoff_results <- run_knockoff_filter(
+          window_results, params$fdr, params$knockoffs,
+          verbose = verbose
+        )
+
+        if (!is.null(results$knockoff_results)) {
+          ko_res <- results$knockoff_results
+          window_ids <- paste(window_results$chr,
+                              window_results$window.start,
+                              window_results$window.end,
+                              sep = ":")
+
+          W_vec <- ko_res$W
+          if (!is.null(W_vec)) {
+            if (is.null(names(W_vec))) {
+              names(W_vec) <- window_ids[seq_along(W_vec)]
+            }
+            window_results$W <- as.numeric(W_vec[match(window_ids, names(W_vec))])
+          }
+
+          Q_vec <- ko_res$Qvalue
+          if (!is.null(Q_vec)) {
+            if (is.null(names(Q_vec))) {
+              names(Q_vec) <- window_ids[seq_along(Q_vec)]
+            }
+            window_results$Qvalue <- as.numeric(Q_vec[match(window_ids, names(Q_vec))])
+          }
+
+          thr_val <- if (!is.null(ko_res$W.threshold)) as.numeric(ko_res$W.threshold) else NA_real_
+          window_results$W_threshold <- thr_val
+          window_results$selected <- ifelse(!is.na(window_results$W) & !is.na(thr_val),
+                                            window_results$W >= thr_val, FALSE)
+        }
+
+        if (!'W' %in% names(window_results)) window_results$W <- NA_real_
+        if (!'Qvalue' %in% names(window_results)) window_results$Qvalue <- NA_real_
+        if (!'W_threshold' %in% names(window_results)) window_results$W_threshold <- NA_real_
+        if (!'selected' %in% names(window_results)) window_results$selected <- FALSE
 
         results$bivariate_results <- window_results
-
-        # 对该文件进行knockoff过滤
-        if (nrow(window_results) > 0) {
-          results$knockoff_results <- run_knockoff_filter(
-            window_results, params$fdr, params$knockoffs,
-            verbose = verbose
-          )
-        }
       }
     }
   }
@@ -741,182 +848,56 @@ run_bivariate_analysis <- function(genotype_matrix, zscore_pheno1, zscore_pheno2
                                   n_samples = 20000, prune_thresh = 99,
                                   verbose = FALSE) {
 
-  if (verbose) cat("运行双变量局部遗传相关性分析...\n")
+  G <- as.matrix(genotype_matrix)
+  if (nrow(G) < 2 || ncol(G) < 2) return(NULL)
 
-  # 数据验证
-  if (is.null(genotype_matrix) || nrow(genotype_matrix) == 0 || ncol(genotype_matrix) == 0) {
-    warning("基因型矩阵为空或维度为0")
-    return(NULL)
-  }
+  Z1 <- as.data.frame(zscore_pheno1)
+  Z2 <- as.data.frame(zscore_pheno2)
+  if (nrow(Z1) != ncol(G) || nrow(Z2) != ncol(G)) return(NULL)
 
-  if (is.null(zscore_pheno1) || nrow(zscore_pheno1) == 0) {
-    warning("表型1 Z-score数据为空")
-    return(NULL)
-  }
+  colnames(Z1)[1] <- "org"
+  colnames(Z2)[1] <- "org"
+  if (ncol(Z1) < 2 || ncol(Z2) < 2) return(NULL)
+  knock_cols <- paste0("knock", seq_len(ncol(Z1) - 1))
+  colnames(Z1)[-1] <- knock_cols
+  colnames(Z2)[-1] <- knock_cols
 
-  if (is.null(zscore_pheno2) || nrow(zscore_pheno2) == 0) {
-    warning("表型2 Z-score数据为空")
-    return(NULL)
-  }
+  keep_cols <- which(apply(G, 2, var, na.rm = TRUE) > 0)
+  if (length(keep_cols) < 2) return(NULL)
+  G <- G[, keep_cols, drop = FALSE]
+  Z1 <- Z1[keep_cols, , drop = FALSE]
+  Z2 <- Z2[keep_cols, , drop = FALSE]
 
-  # 确保zscore数据是data.frame格式
-  if (!is.data.frame(zscore_pheno1)) {
-    zscore_pheno1 <- as.data.frame(zscore_pheno1)
-  }
-  if (!is.data.frame(zscore_pheno2)) {
-    zscore_pheno2 <- as.data.frame(zscore_pheno2)
-  }
-
-  # 强化数据检查和预处理
-  # 1. 保证基因型矩阵为数值型，且无全零/无变异行
-  genotype_matrix <- as.matrix(genotype_matrix)
-  if (!is.numeric(genotype_matrix)) {
-    genotype_matrix <- apply(genotype_matrix, c(1,2), as.numeric)
-  }
-  # 剔除无变异SNP
-  snp_var <- apply(genotype_matrix, 1, var, na.rm=TRUE)
-  valid_snps <- which(snp_var > 0 & !is.na(snp_var))
-  if (length(valid_snps) < 2) {
-    warning("有效SNP数量不足")
-    return(NULL)
-  }
-  genotype_matrix <- genotype_matrix[valid_snps,,drop=FALSE]
-  zscore_pheno1 <- zscore_pheno1[valid_snps,,drop=FALSE]
-  zscore_pheno2 <- zscore_pheno2[valid_snps,,drop=FALSE]
-
-  # 2. 保证Z-score数据为data.frame，行数与基因型矩阵一致，列名标准
-  zscore_pheno1 <- as.data.frame(zscore_pheno1)
-  zscore_pheno2 <- as.data.frame(zscore_pheno2)
-  # 自动修正列名
-  knockoff_names <- paste0("knock", seq_len(ncol(zscore_pheno1)-1))
-  colnames(zscore_pheno1)[1] <- "org"
-  if (length(knockoff_names) > 0) colnames(zscore_pheno1)[2:ncol(zscore_pheno1)] <- knockoff_names
-  colnames(zscore_pheno2)[1] <- "org"
-  if (length(knockoff_names) > 0) colnames(zscore_pheno2)[2:ncol(zscore_pheno2)] <- knockoff_names
-
-  # 3. 检查维度完全一致
-  if (nrow(genotype_matrix) != nrow(zscore_pheno1) || nrow(genotype_matrix) != nrow(zscore_pheno2)) {
-    warning(paste("最终维度不匹配: 基因型", nrow(genotype_matrix), "表型1", nrow(zscore_pheno1), "表型2", nrow(zscore_pheno2)))
-    return(NULL)
-  }
-  if (any(is.na(genotype_matrix)) || any(is.na(zscore_pheno1)) || any(is.na(zscore_pheno2))) {
-    warning("输入数据存在NA值")
-    return(NULL)
-  }
-
-  # 检查是否有足够的knockoff列
-  required_cols <- c("org", paste0("knock", 1:5))  # 假设5个knockoffs
-
-  if (!all(required_cols %in% colnames(zscore_pheno1))) {
-    if (verbose) cat("表型1缺少knockoff列，尝试基本格式...\n")
-    # 如果没有标准的knockoff列，检查是否有数字列
-    if (ncol(zscore_pheno1) < 2) {
-      warning("表型1 Z-score数据列数不足")
-      return(NULL)
-    }
-  }
-
-  if (!all(required_cols %in% colnames(zscore_pheno2))) {
-    if (verbose) cat("表型2缺少knockoff列，尝试基本格式...\n")
-    if (ncol(zscore_pheno2) < 2) {
-      warning("表型2 Z-score数据列数不足")
-      return(NULL)
-    }
-  }
-
-  tryCatch({
-    # 确保数据格式正确
-    # LAVAKnock期望Z-score数据有特定的列格式
-    if (!"org" %in% colnames(zscore_pheno1)) {
-      # 如果没有org列，将第一列作为原始分数
-      if (ncol(zscore_pheno1) >= 1) {
-        colnames(zscore_pheno1)[1] <- "org"
-      }
-    }
-
-    if (!"org" %in% colnames(zscore_pheno2)) {
-      if (ncol(zscore_pheno2) >= 1) {
-        colnames(zscore_pheno2)[1] <- "org"
-      }
-    }
-
-    # 确保基因型矩阵是数值型
-    if (!is.numeric(genotype_matrix)) {
-      genotype_matrix <- as.matrix(as.numeric(genotype_matrix))
-      dim(genotype_matrix) <- c(nrow(genotype_matrix), ncol(genotype_matrix))
-    }
-
-    # 检查基因型矩阵是否有变异
-    genotype_var <- apply(genotype_matrix, 1, var, na.rm = TRUE)
-    if (any(is.na(genotype_var)) || any(genotype_var == 0)) {
-      if (verbose) cat("移除无变异的SNPs...\n")
-      valid_snps <- !is.na(genotype_var) & genotype_var > 0
-      genotype_matrix <- genotype_matrix[valid_snps, , drop = FALSE]
-      zscore_pheno1 <- zscore_pheno1[valid_snps, , drop = FALSE]
-      zscore_pheno2 <- zscore_pheno2[valid_snps, , drop = FALSE]
-
-      if (nrow(genotype_matrix) < 2) {
-        warning("有效SNPs数量不足")
-        return(NULL)
-      }
-    }
-
+  effective_n <- n_samples
+  geno_n <- nrow(G)
+  if (!is.na(geno_n) && geno_n > 1 && geno_n != n_samples) {
     if (verbose) {
-      cat("调试信息:\n")
-      cat("  最终基因型矩阵维度:", paste(dim(genotype_matrix), collapse = "x"), "\n")
-      cat("  最终表型1维度:", paste(dim(zscore_pheno1), collapse = "x"), "\n")
-      cat("  最终表型2维度:", paste(dim(zscore_pheno2), collapse = "x"), "\n")
-      cat("  表型1列名:", paste(colnames(zscore_pheno1), collapse = ", "), "\n")
-      cat("  表型2列名:", paste(colnames(zscore_pheno2), collapse = ", "), "\n")
+      message(sprintf(
+        "  注意: 提供的样本量(n=%s)与基因型行数(n=%s)不一致，双变量分析将使用后者以匹配矩阵维度",
+        n_samples, geno_n
+      ))
     }
+    effective_n <- geno_n
+  }
 
-    # 只尝试LAVAKnock_bivariate，失败时直接返回NULL
-    result <- tryCatch({
-      LAVAKnock::LAVAKnock_bivariate(
-        Zscore_pheno1_window = zscore_pheno1,
-        Zscore_pheno2_window = zscore_pheno2,
-        G_window = genotype_matrix,
-        chr = chr,
-        window_start = window_start,
-        window_end = window_end,
-        n = n_samples,
-        prune.thresh = prune_thresh
-      )
-    }, error = function(e1) {
-      warning(paste("LAVAKnock_bivariate失败:", e1$message))
-      if (verbose) {
-        cat("详细错误调试信息:\n")
-        cat("  错误消息:", e1$message, "\n")
-        cat("  基因型矩阵维度:", paste(dim(genotype_matrix), collapse = "x"), "\n")
-        cat("  基因型矩阵类型:", class(genotype_matrix), "\n")
-        cat("  表型1维度:", paste(dim(zscore_pheno1), collapse = "x"), "\n")
-        cat("  表型2维度:", paste(dim(zscore_pheno2), collapse = "x"), "\n")
-        cat("  表型1列名:", paste(colnames(zscore_pheno1), collapse = ", "), "\n")
-        cat("  表型2列名:", paste(colnames(zscore_pheno2), collapse = ", "), "\n")
-        cat("  基因型矩阵前几行前几列:\n")
-        print(genotype_matrix[seq_len(min(3, nrow(genotype_matrix))), seq_len(min(3, ncol(genotype_matrix)))])
-      }
-      return(NULL)
-    })
-    if (verbose && !is.null(result)) cat("双变量分析完成\n")
-    return(result)
-
-  }, error = function(e) {
-    warning(paste("双变量分析失败:", e$message))
-    if (verbose) {
-      cat("详细错误调试信息:\n")
-      cat("  错误消息:", e$message, "\n")
-      cat("  基因型矩阵维度:", paste(dim(genotype_matrix), collapse = "x"), "\n")
-      cat("  基因型矩阵类型:", class(genotype_matrix), "\n")
-      cat("  表型1维度:", paste(dim(zscore_pheno1), collapse = "x"), "\n")
-      cat("  表型2维度:", paste(dim(zscore_pheno2), collapse = "x"), "\n")
-      cat("  表型1列名:", paste(colnames(zscore_pheno1), collapse = ", "), "\n")
-      cat("  表型2列名:", paste(colnames(zscore_pheno2), collapse = ", "), "\n")
-      cat("  基因型矩阵前几行前几列:\n")
-      print(genotype_matrix[1:min(3, nrow(genotype_matrix)), 1:min(3, ncol(genotype_matrix))])
+  res <- tryCatch(
+    LAVAKnock::LAVAKnock_bivariate(
+      Zscore_pheno1_window = Z1,
+      Zscore_pheno2_window = Z2,
+      G_window = G,
+      chr = chr,
+      window_start = window_start,
+      window_end = window_end,
+      n = effective_n,
+      prune.thresh = prune_thresh
+    ),
+    error = function(e) {
+      if (verbose) message("LAVAKnock_bivariate失败: ", e$message)
+      NULL
     }
-    return(NULL)
-  })
+  )
+
+  res
 }
 
 #' Knockoff 多重检验校正
@@ -1006,6 +987,7 @@ execute_pipeline <- function(opts) {
       cat(sprintf('自动生成Info与GWAS：%d 个变异\n', nrow(info_df)))
     }
     opts$info <- info_path
+    opts$info_label <- safe_base
     if (is.null(opts$gwas1) && length(gwas_paths) >= 1) opts$gwas1 <- gwas_paths[1]
     if (is.null(opts$gwas2) && length(gwas_paths) >= 2) opts$gwas2 <- gwas_paths[2]
     if (is.null(opts$ref_plink)) opts$ref_plink <- panel_default
@@ -1019,6 +1001,10 @@ execute_pipeline <- function(opts) {
 
   if (is.null(opts$info)) {
     stop('必须提供 --info 或同时提供 --zscore 与 --panel/--ref_plink')
+  }
+
+  if (is.null(opts$info_label) || !nzchar(opts$info_label)) {
+    opts$info_label <- gsub('[^A-Za-z0-9_]+', '_', tools::file_path_sans_ext(basename(opts$info)))
   }
 
   if (!is.null(auto_trait_names)) {
@@ -1052,66 +1038,56 @@ execute_pipeline <- function(opts) {
   info <- as.data.frame(py_load_variant_info(opts$info), stringsAsFactors = FALSE)
   if (is.null(info) || nrow(info) == 0) stop('变异信息文件读取失败或为空')
 
-  g1 <- NULL
-  g2 <- NULL
+  gwas_primary <- NULL
+  gwas_secondary <- NULL
+
   if (!is.null(opts$gwas1)) {
     gwas1_df <- as.data.frame(py_load_gwas_table(opts$gwas1), stringsAsFactors = FALSE)
-    gwas1_df$CHR <- as.integer(gwas1_df$CHR)
-    gwas1_df$POS <- as.numeric(gwas1_df$POS)
-    gwas1_df$Z <- as.numeric(gwas1_df$Z)
-    gwas1_df <- gwas1_df[!is.na(gwas1_df$CHR) & !is.na(gwas1_df$POS) & !is.na(gwas1_df$Z), , drop = FALSE]
-    g1 <- merge(info, gwas1_df, by.x = c('chr', 'pos_bp'), by.y = c('CHR', 'POS'))
-    if (nrow(g1) == 0) stop('变异信息与GWAS在CHR+POS上没有交集')
+    gwas_primary <- merge_gwas_with_info(info, gwas1_df)
+    if (is.null(gwas_primary) || nrow(gwas_primary) == 0) {
+      stop('变异信息与GWAS1在CHR+POS上没有交集')
+    }
     if (!is.null(opts$gwas2)) {
       gwas2_df <- as.data.frame(py_load_gwas_table(opts$gwas2), stringsAsFactors = FALSE)
-      gwas2_df$CHR <- as.integer(gwas2_df$CHR)
-      gwas2_df$POS <- as.numeric(gwas2_df$POS)
-      gwas2_df$Z <- as.numeric(gwas2_df$Z)
-      gwas2_df <- gwas2_df[!is.na(gwas2_df$CHR) & !is.na(gwas2_df$POS) & !is.na(gwas2_df$Z), , drop = FALSE]
-      g2 <- merge(info, gwas2_df, by.x = c('chr', 'pos_bp'), by.y = c('CHR', 'POS'))
-      if (nrow(g2) == 0) stop('变异信息与GWAS在CHR+POS上没有交集 (gwas2)')
+      gwas_secondary <- merge_gwas_with_info(info, gwas2_df)
+      if (is.null(gwas_secondary) || nrow(gwas_secondary) == 0) {
+        stop('变异信息与GWAS2在CHR+POS上没有交集')
+      }
     }
   } else if (!is.null(opts$multi_gwas) && !is.null(opts$zcols)) {
     mg <- py_load_multi_gwas_table(opts$multi_gwas, opts$zcols)
-    m <- as.data.frame(mg$data, stringsAsFactors = FALSE)
-    m$CHR <- as.integer(m$CHR)
-    m$POS <- as.numeric(m$POS)
-    m <- m[!is.na(m$CHR) & !is.na(m$POS), , drop = FALSE]
-    merged <- merge(info, m, by.x = c('chr', 'pos_bp'), by.y = c('CHR', 'POS'))
+    merged <- merge(info, as.data.frame(mg$data, stringsAsFactors = FALSE),
+                    by.x = c('chr', 'pos_bp'), by.y = c('CHR', 'POS'),
+                    all = FALSE, sort = FALSE)
     if (nrow(merged) == 0) stop('变异信息与multi_gwas无法匹配')
-    zc <- as.character(mg$zcols)
+    zc <- trimws(as.character(mg$zcols))
     if (length(zc) < 1) stop('未在 multi_gwas 中找到指定的Z列')
-    g1 <- merged
-    g1$Z <- as.numeric(merged[[zc[1]]])
+    gwas_primary <- merged[, c(names(info), zc[1]), drop = FALSE]
+    names(gwas_primary)[ncol(gwas_primary)] <- "Z"
     if (length(zc) >= 2) {
-      g2 <- merged
-      g2$Z <- as.numeric(merged[[zc[2]]])
+      gwas_secondary <- merged[, c(names(info), zc[2]), drop = FALSE]
+      names(gwas_secondary)[ncol(gwas_secondary)] <- "Z"
     }
   } else {
     stop('未提供 GWAS 输入。请使用 --gwas1/--gwas2 或 --multi_gwas 配合 --zcols')
   }
 
-  if (!is.null(g2)) {
-    shared_idx <- !is.na(g1$Z) & !is.na(g2$Z)
-    g1 <- g1[shared_idx, ]
-    g2 <- g2[shared_idx, ]
-  } else {
-    g1 <- g1[!is.na(g1$Z), ]
-  }
-  if (nrow(g1) == 0) {
+  aligned_gwas <- align_dual_traits(gwas_primary, gwas_secondary, verbose = opts$verbose)
+  if (nrow(aligned_gwas) == 0) {
     stop('未能获得有效的GWAS记录，请检查输入文件是否与变异信息匹配')
   }
 
   gwas_data <- data.frame(
-    rsid = g1$rsid,
-    chr = g1$chr,
-    pos_bp = g1$pos_bp,
-    zscore_pheno1 = g1$Z,
-    zscore_pheno2 = if (!is.null(g2)) g2$Z else rep(NA_real_, nrow(g1)),
+    rsid = aligned_gwas$rsid,
+    chr = aligned_gwas$chr,
+    pos_bp = aligned_gwas$pos_bp,
+    zscore_pheno1 = aligned_gwas$zscore_pheno1,
+    zscore_pheno2 = aligned_gwas$zscore_pheno2,
     stringsAsFactors = FALSE
   )
   attr(gwas_data, 'pheno1_name') <- opts$pheno1_name
-  attr(gwas_data, 'pheno2_name') <- if (!is.null(g2)) opts$pheno2_name else NA_character_
+  has_trait2 <- any(!is.na(gwas_data$zscore_pheno2))
+  attr(gwas_data, 'pheno2_name') <- if (has_trait2) opts$pheno2_name else NA_character_
 
   target_snp_ids <- unique(stats::na.omit(gwas_data$rsid))
   chrpos_ids <- paste0(gwas_data$chr, ':', gwas_data$pos_bp)
@@ -1152,8 +1128,12 @@ execute_pipeline <- function(opts) {
     variant_ids <- paste0(gwas_selected$chr, ':', gwas_selected$pos_bp)
     colnames(geno_matrix) <- variant_ids
   }
-  variant_positions <- as.numeric(ali$positions)
-  if (length(variant_positions) != length(variant_ids) || any(is.na(variant_positions))) {
+  variant_positions <- align_positions_with_info(
+    variant_ids,
+    info,
+    fallback_positions = as.numeric(ali$positions)
+  )
+  if (length(variant_positions) != length(variant_ids) || all(is.na(variant_positions))) {
     variant_positions <- gwas_selected$pos_bp
   }
   z_vec <- as.numeric(gwas_selected$zscore_pheno1)
@@ -1258,8 +1238,6 @@ execute_pipeline <- function(opts) {
       # 去除空结果
       results <- Filter(Negate(is.null), results)
 
-      quit()
-
       if (length(results) > 0) {
         chunk_tables_data <- lapply(results, `[[`, "table")
         chunk_records <- lapply(results, `[[`, "record")
@@ -1303,8 +1281,6 @@ execute_pipeline <- function(opts) {
       selection_table$nearest_gene <- NA_character_
     }
 
-    plot_cols <- intersect(c('id', 'chr', 'pos', 'W', 'selected', 'W_threshold'), colnames(selection_table))
-    plot_df <- selection_table[, plot_cols, drop = FALSE]
     drop_cols <- intersect(c('chunk_id', 'chunk_chr', 'chunk_start', 'chunk_end', 'chunk_size_bp',
                              'partition_source', 'rsid', 'chr', 'pos', 'geno_source'), colnames(selection_table))
     final_table <- selection_table
@@ -1317,11 +1293,7 @@ execute_pipeline <- function(opts) {
     old_files <- list.files(out_dir, full.names = TRUE)
     if (length(old_files) > 0) unlink(old_files, recursive = TRUE, force = TRUE)
 
-    prefix_base <- if (!is.null(opts$zscore)) {
-      gsub('[^A-Za-z0-9_]+', '_', tools::file_path_sans_ext(basename(opts$zscore)))
-    } else {
-      tools::file_path_sans_ext(basename(opts$info))
-    }
+    prefix_base <- opts$info_label
     prefix <- paste0(prefix_base, '_', gsub('[^A-Za-z0-9_]+', '_', attr(gwas_data, 'pheno1_name')))
 
     out_csv <- file.path(out_dir, paste0(prefix, '_selection.csv'))
@@ -1356,14 +1328,6 @@ execute_pipeline <- function(opts) {
       }
     }
 
-    manhattan_path <- file.path(out_dir, paste0(prefix, '_manhattan.png'))
-    threshold_val <- NULL
-    if ('W_threshold' %in% colnames(plot_df)) {
-      thr_candidates <- unique(stats::na.omit(plot_df$W_threshold))
-      if (length(thr_candidates) > 0) threshold_val <- max(thr_candidates)
-    }
-    plot_manhattan_w(plot_df, manhattan_path, title = paste0(prefix_base, ' (', attr(gwas_data, 'pheno1_name'), ')'), threshold = threshold_val)
-
     if (opts$verbose) cat(sprintf('已保存结果: %s\n', out_csv))
 
   } else if (opts$mode == 'correl') {
@@ -1377,7 +1341,9 @@ execute_pipeline <- function(opts) {
       fdr = opts$fdr,
       ld_threshold = 0.75,
       prune_threshold = 99,
-      run_mode = 'ghostknockoff_only'
+      run_mode = 'ghostknockoff_only',
+      ld_coord = opts$ld_coord,
+      threads = opts$threads
     )
     chr <- unique(gwas_data$chr)[1]
     res <- process_single_locus(
@@ -1393,67 +1359,68 @@ execute_pipeline <- function(opts) {
     out_dir <- file.path(opts$outdir, 'correlation')
     dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
     prefix <- paste0(
-      tools::file_path_sans_ext(basename(opts$info)),
+      opts$info_label,
       '_', gsub('[^A-Za-z0-9_]+', '_', attr(gwas_data, 'pheno1_name')),
       '__', gsub('[^A-Za-z0-9_]+', '_', attr(gwas_data, 'pheno2_name'))
     )
+    n_kn <- if (!is.null(opts$knockoffs) && opts$knockoffs > 0) opts$knockoffs else 5
+    desired_kn_cols <- paste0('pval.knockoff', seq_len(n_kn))
+    desired_cols <- c('chr', 'window.start', 'window.end', 'pval.orginal', desired_kn_cols, 'W', 'Q')
+
     if (is.null(res$bivariate_results) || nrow(res$bivariate_results) == 0) {
-      empty_biv <- data.frame(
-        chr = integer(),
-        window.start = integer(),
-        window.end = integer(),
-        pval.orginal = numeric(),
-        stringsAsFactors = FALSE
-      )
+      empty_biv <- as.data.frame(setNames(replicate(length(desired_cols), numeric(), simplify = FALSE), desired_cols))
       readr::write_csv(empty_biv, file.path(out_dir, paste0(prefix, '_bivariate.csv')))
     } else {
-      readr::write_csv(res$bivariate_results, file.path(out_dir, paste0(prefix, '_bivariate.csv')))
-    }
-    if (!is.null(res$knockoff_results) && !is.null(res$knockoff_results$window_sign) && length(res$knockoff_results$window_sign) > 0) {
-      ko <- res$knockoff_results
-      sig <- data.frame(
-        window = ko$window_sign,
-        W = ko$W[match(ko$window_sign, names(ko$W))],
-        Qvalue = ko$Qvalue[match(ko$window_sign, names(ko$Qvalue))],
-        stringsAsFactors = FALSE
-      )
-      readr::write_csv(sig, file.path(out_dir, paste0(prefix, '_significant_windows.csv')))
-    } else {
-      empty_sig <- data.frame(window = character(), W = numeric(), Qvalue = numeric(), stringsAsFactors = FALSE)
-      readr::write_csv(empty_sig, file.path(out_dir, paste0(prefix, '_significant_windows.csv')))
+      biv_export <- res$bivariate_results
+      if (!'W' %in% colnames(biv_export)) biv_export$W <- NA_real_
+      if (!'Qvalue' %in% colnames(biv_export)) biv_export$Qvalue <- NA_real_
+      for (col in desired_kn_cols) {
+        if (!col %in% colnames(biv_export)) {
+          biv_export[[col]] <- NA_real_
+        }
+      }
+      biv_export$Q <- as.numeric(biv_export$Qvalue)
+      biv_export$Qvalue <- NULL
+      missing_cols <- setdiff(desired_cols, colnames(biv_export))
+      for (col in missing_cols) {
+        biv_export[[col]] <- if (col %in% c('chr')) NA_integer_ else NA_real_
+      }
+      biv_export$chr <- as.integer(biv_export$chr)
+      biv_export$window.start <- as.numeric(biv_export$window.start)
+      biv_export$window.end <- as.numeric(biv_export$window.end)
+      biv_export$pval.orginal <- as.numeric(biv_export$pval.orginal)
+      for (col in desired_kn_cols) {
+        biv_export[[col]] <- as.numeric(biv_export[[col]])
+      }
+      biv_export$W <- as.numeric(biv_export$W)
+      biv_export$Q <- as.numeric(biv_export$Q)
+      biv_export <- biv_export[, desired_cols, drop = FALSE]
+      readr::write_csv(biv_export, file.path(out_dir, paste0(prefix, '_bivariate.csv')))
     }
 
-    if (!is.null(res$bivariate_results) && nrow(res$bivariate_results) > 0 && !is.null(res$knockoff_results)) {
+    if (!is.null(res$knockoff_results) && !is.null(res$knockoff_results$window_sign) && length(res$knockoff_results$window_sign) > 0) {
       ko <- res$knockoff_results
-      window_ids <- paste(res$bivariate_results$chr,
-                          res$bivariate_results$window.start,
-                          res$bivariate_results$window.end,
-                          sep = ":")
-      W_vec <- ko$W
-      if (is.null(names(W_vec))) {
-        names(W_vec) <- window_ids[seq_along(W_vec)]
-      }
-      w_match <- W_vec[match(window_ids, names(W_vec))]
-      plot_df <- data.frame(
-        id = window_ids,
-        chr = res$bivariate_results$chr,
-        pos = floor((res$bivariate_results$window.start + res$bivariate_results$window.end) / 2),
-        W = as.numeric(w_match),
-        selected = window_ids %in% ko$window_sign,
+      win_split <- strsplit(ko$window_sign, ':', fixed = TRUE)
+      chr_vec <- suppressWarnings(as.integer(vapply(win_split, function(x) x[1], character(1))))
+      start_vec <- suppressWarnings(as.numeric(vapply(win_split, function(x) ifelse(length(x) >= 2, x[2], NA_character_), character(1))))
+      end_vec <- suppressWarnings(as.numeric(vapply(win_split, function(x) ifelse(length(x) >= 3, x[3], NA_character_), character(1))))
+      W_vals <- ko$W[match(ko$window_sign, names(ko$W))]
+      Q_vals <- ko$Qvalue[match(ko$window_sign, names(ko$Qvalue))]
+      sig <- data.frame(
+        chr = chr_vec,
+        window.start = start_vec,
+        window.end = end_vec,
+        W = as.numeric(W_vals),
+        Q = as.numeric(Q_vals),
         W_threshold = if (!is.null(ko$W.threshold)) as.numeric(ko$W.threshold) else NA_real_,
         stringsAsFactors = FALSE
       )
-      plot_df <- plot_df[!is.na(plot_df$chr) & !is.na(plot_df$pos) & !is.na(plot_df$W), , drop = FALSE]
-      if (nrow(plot_df) > 0) {
-        thr_val <- if (!is.null(ko$W.threshold)) as.numeric(ko$W.threshold) else NULL
-        manhattan_path <- file.path(out_dir, paste0(prefix, '_manhattan.png'))
-        plot_manhattan_w(
-          plot_df,
-          manhattan_path,
-          title = paste0(prefix, ' (W statistic)'),
-          threshold = thr_val
-        )
-      }
+      sig <- sig[!is.na(sig$chr) & !is.na(sig$window.start) & !is.na(sig$window.end), , drop = FALSE]
+      if (nrow(sig) > 0) sig <- unique(sig)
+      readr::write_csv(sig, file.path(out_dir, paste0(prefix, '_significant_windows.csv')))
+    } else {
+      empty_sig <- data.frame(chr = integer(), window.start = numeric(), window.end = numeric(), W = numeric(), Q = numeric(), W_threshold = numeric(), stringsAsFactors = FALSE)
+      readr::write_csv(empty_sig, file.path(out_dir, paste0(prefix, '_significant_windows.csv')))
     }
 
     if (opts$verbose) cat('相关性分析完成并已保存结果\n')

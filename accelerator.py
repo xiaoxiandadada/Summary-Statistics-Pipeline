@@ -23,7 +23,6 @@ from functools import lru_cache
 
 import numpy as np
 import pandas as pd
-from numba import jit, prange
 
 __all__ = [
     # genotype
@@ -47,29 +46,6 @@ __all__ = [
 ]
 
 
-@jit(nopython=True, parallel=True)
-def _corr_numba(X):  # type: ignore
-    n, p = X.shape
-    corr = np.zeros((p, p))
-    # standardize columns
-    for j in prange(p):
-        mean_j = np.mean(X[:, j])
-        std_j = np.std(X[:, j])
-        if std_j > 0.0:
-            X[:, j] = (X[:, j] - mean_j) / std_j
-        else:
-            X[:, j] = 0.0
-    for i in prange(p):
-        for j in range(i, p):
-            v = 0.0
-            for k in range(n):
-                v += X[k, i] * X[k, j]
-            v = v / (n - 1)
-            corr[i, j] = v
-            corr[j, i] = v
-    return corr
-
-
 def fast_correlation_matrix(X):
     """Compute correlation matrix for a samples×SNPs matrix.
 
@@ -78,8 +54,18 @@ def fast_correlation_matrix(X):
     X = np.asarray(X, dtype=np.float64)
     if X.ndim != 2:
         raise ValueError('X must be a 2D array')
-    # make a copy because numba version modifies X in-place during standardization
-    return _corr_numba(X.copy())
+    n, p = X.shape
+    if p == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    if n <= 1:
+        raise ValueError('At least two samples required to compute correlation')
+    X_centered = X - np.mean(X, axis=0, keepdims=True)
+    std = np.std(X_centered, axis=0, ddof=1)
+    std[std == 0] = 1.0
+    X_normalized = X_centered / std
+    corr = (X_normalized.T @ X_normalized) / (n - 1)
+    np.clip(corr, -1.0, 1.0, out=corr)
+    return corr
 
 
 def ld_pruning(corr_matrix, threshold: float = 0.75):
@@ -118,8 +104,6 @@ def _canon_pos(series):
 def _read_table_auto(path):
     return pd.read_csv(path, sep=None, engine='python')
 
-
-# %% MARK: LD block partitioning helpers
 
 BLOCK_FILES = {
     'GRCH37': 'LAVA_s2500_m25_f1_w200.blocks',
