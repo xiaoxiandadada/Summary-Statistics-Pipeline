@@ -20,6 +20,10 @@ if (length(missing_packages) > 0) {
 
 suppressPackageStartupMessages(invisible(lapply(pipeline_packages, library, character.only = TRUE)))
 
+if (file.exists("plotting.R")) {
+  source("plotting.R")
+}
+
 # Python 加速（直接从 accelerator.py 载入）
 py_env <- new.env(parent = emptyenv())
 py_ok <- FALSE
@@ -948,6 +952,7 @@ run_knockoff_filter <- function(bivariate_results, fdr = 0.1, n_knockoffs = 5,
 execute_pipeline <- function(opts) {
   auto_temp_paths <- character()
   auto_trait_names <- NULL
+  should_plot <- exists("plot_manhattan")
 
   if (!is.null(opts$panel) && is.null(opts$ref_plink)) {
     opts$ref_plink <- opts$panel
@@ -1296,6 +1301,25 @@ execute_pipeline <- function(opts) {
     prefix_base <- opts$info_label
     prefix <- paste0(prefix_base, '_', gsub('[^A-Za-z0-9_]+', '_', attr(gwas_data, 'pheno1_name')))
 
+    if (should_plot && exists("plot_manhattan")) {
+      plot_cols <- intersect(c('id', 'chr', 'pos', 'W', 'selected', 'W_threshold'), colnames(selection_table))
+      plot_df <- selection_table[, plot_cols, drop = FALSE]
+      if (all(c('chr', 'pos', 'W') %in% names(plot_df))) {
+        thr_val <- NULL
+        if ('W_threshold' %in% names(plot_df)) {
+          thr_candidates <- unique(stats::na.omit(plot_df$W_threshold))
+          if (length(thr_candidates) > 0) thr_val <- max(thr_candidates)
+        }
+        manhattan_path <- file.path(out_dir, paste0(prefix, '_manhattan.png'))
+        try(plot_manhattan(
+          plot_df,
+          manhattan_path,
+          title = paste0(prefix_base, ' (', attr(gwas_data, 'pheno1_name'), ')'),
+          threshold = thr_val
+        ), silent = TRUE)
+      }
+    }
+
     out_csv <- file.path(out_dir, paste0(prefix, '_selection.csv'))
     readr::write_csv(final_table, out_csv)
 
@@ -1335,8 +1359,8 @@ execute_pipeline <- function(opts) {
       data_dir = dirname(opts$info),
       output_dir = opts$outdir,
       sample_size = opts$n,
-      window_size = opts$win,
-      window_step = opts$step,
+      window_size = 5000000L,
+      window_step = 5000000L,
       knockoffs = opts$knockoffs,
       fdr = opts$fdr,
       ld_threshold = 0.75,
@@ -1421,6 +1445,29 @@ execute_pipeline <- function(opts) {
     } else {
       empty_sig <- data.frame(chr = integer(), window.start = numeric(), window.end = numeric(), W = numeric(), Q = numeric(), W_threshold = numeric(), stringsAsFactors = FALSE)
       readr::write_csv(empty_sig, file.path(out_dir, paste0(prefix, '_significant_windows.csv')))
+    }
+
+    if (should_plot && exists("plot_manhattan") && !is.null(res$bivariate_results) && nrow(res$bivariate_results) > 0) {
+      plot_df <- res$bivariate_results
+      if (!'pos' %in% colnames(plot_df) || all(is.na(plot_df$pos))) {
+        plot_df$pos <- floor((as.numeric(plot_df$window.start) + as.numeric(plot_df$window.end)) / 2)
+      }
+      needed_cols <- intersect(c('id', 'chr', 'pos', 'W', 'selected', 'W_threshold'), colnames(plot_df))
+      plot_df <- plot_df[, needed_cols, drop = FALSE]
+      if (all(c('chr', 'pos', 'W') %in% names(plot_df))) {
+        thr_val <- NULL
+        if ('W_threshold' %in% names(plot_df)) {
+          thr_candidates <- unique(stats::na.omit(plot_df$W_threshold))
+          if (length(thr_candidates) > 0) thr_val <- max(thr_candidates)
+        }
+        manhattan_path <- file.path(out_dir, paste0(prefix, '_manhattan.png'))
+        try(plot_manhattan(
+          plot_df,
+          manhattan_path,
+          title = paste0(prefix, ' (W statistic)'),
+          threshold = thr_val
+        ), silent = TRUE)
+      }
     }
 
     if (opts$verbose) cat('相关性分析完成并已保存结果\n')

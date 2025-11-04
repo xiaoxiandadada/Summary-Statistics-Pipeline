@@ -22,9 +22,10 @@ Rscript install_packages.R --python /path/to/python
 ```bash
 RETICULATE_PYTHON=.venv/bin/python \
 Rscript run_pipeline.R --mode select \
-  --zscore test/zscore_demo.tsv \
-  --panel test/demo_chr10 \
+  --zscore data/demo/zscore_demo.tsv \
+  --panel data/demo/demo_chr10 \
   --ld_coord GRCh37 \
+  --fdr 0.1 --knockoffs 5 \
   -o results/select_demo -v
 ```
 
@@ -32,12 +33,12 @@ Rscript run_pipeline.R --mode select \
 ```bash
 RETICULATE_PYTHON=.venv/bin/python \
 Rscript run_pipeline.R --mode correl \
-  --info test/demo_info.csv \
-  --gwas1 test/gwas_trait1.tsv \
-  --gwas2 test/gwas_trait2.tsv \
-  --panel test/demo_chr10 \
+  --info data/demo/demo_info.csv \
+  --gwas1 data/demo/gwas_trait1.tsv \
+  --gwas2 data/demo/gwas_trait2.tsv \
+  --panel data/demo/demo_chr10 \
   --ld_coord GRCh37 \
-  --win 5000000 --step 5000000 \
+  --fdr 0.1 --knockoffs 5 \
   -o results/correl_demo -v
 ```
 
