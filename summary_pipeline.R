@@ -75,6 +75,10 @@ py_load_genotype_plink <- function(prefix, snp_ids = NULL, chrpos_ids = NULL) {
   reticulate::py_to_r(py_env$load_genotype_plink(prefix, snp_ids, chrpos_ids))
 }
 
+py_build_info_from_gwas <- function(path) {
+  reticulate::py_to_r(py_env$build_info_from_gwas(path))
+}
+
 py_align_genotype_to_gwas <- function(geno_matrix, colnames_geno, chrpos_attr, rsid_attr, gwas_df, prefer_rsid = TRUE) {
   reticulate::py_to_r(py_env$align_genotype_to_gwas(
     geno_matrix,
@@ -84,6 +88,17 @@ py_align_genotype_to_gwas <- function(geno_matrix, colnames_geno, chrpos_attr, r
     gwas_df,
     prefer_rsid
   ))
+}
+
+py_align_dual_traits <- function(primary_df, secondary_df = NULL) {
+  sec <- if (is.null(secondary_df)) NULL else reticulate::r_to_py(secondary_df)
+  res <- reticulate::py_to_r(py_env$align_dual_traits(reticulate::r_to_py(primary_df), sec))
+  as.data.frame(res, stringsAsFactors = FALSE)
+}
+
+py_align_positions <- function(variant_ids, variant_info, fallback_positions = NULL) {
+  info_py <- reticulate::r_to_py(as.data.frame(variant_info, stringsAsFactors = FALSE))
+  reticulate::py_to_r(py_env$align_positions_with_info(variant_ids, info_py, fallback_positions))
 }
 
 load_gene_catalog <- function(coord, base_dir = '.') {
@@ -174,75 +189,6 @@ align_genotype_to_gwas <- function(geno_matrix, gwas_df, prefer_rsid = TRUE) {
     positions = as.numeric(res$positions),
     rsid = res$rsid
   )
-}
-
-merge_gwas_with_info <- function(info_df, gwas_df) {
-  if (is.null(gwas_df)) return(NULL)
-  if (!all(c("CHR", "POS", "Z") %in% names(gwas_df))) {
-    stop("GWAS 文件缺少 CHR/POS/Z 列")
-  }
-  gwas_df <- gwas_df[!is.na(gwas_df$CHR) & !is.na(gwas_df$POS), , drop = FALSE]
-  gwas_df$CHR <- as.integer(gwas_df$CHR)
-  gwas_df$POS <- as.numeric(gwas_df$POS)
-  gwas_df$Z <- as.numeric(gwas_df$Z)
-  gwas_df <- gwas_df[!is.na(gwas_df$Z), , drop = FALSE]
-  if (nrow(gwas_df) == 0) return(NULL)
-
-  merged <- merge(
-    info_df,
-    gwas_df,
-    by.x = c("chr", "pos_bp"),
-    by.y = c("CHR", "POS"),
-    all = FALSE,
-    sort = FALSE
-  )
-
-  if ("rsid.x" %in% names(merged) || "rsid.y" %in% names(merged)) {
-    rsid_x <- if ("rsid.x" %in% names(merged)) merged$rsid.x else NA_character_
-    rsid_y <- if ("rsid.y" %in% names(merged)) merged$rsid.y else NA_character_
-    merged$rsid <- ifelse(!is.na(rsid_x) & nzchar(rsid_x), rsid_x, rsid_y)
-    merged$rsid.x <- NULL
-    merged$rsid.y <- NULL
-  }
-
-  merged$Z <- as.numeric(merged$Z)
-  merged[!is.na(merged$Z), , drop = FALSE]
-}
-
-align_dual_traits <- function(primary_df, secondary_df = NULL, verbose = FALSE) {
-  if (is.null(primary_df) || nrow(primary_df) == 0) {
-    stop("主表型数据为空")
-  }
-
-  if (is.null(secondary_df) || nrow(secondary_df) == 0) {
-    primary_df$zscore_pheno1 <- as.numeric(primary_df$Z)
-    primary_df$zscore_pheno2 <- NA_real_
-    primary_df$Z <- NULL
-    return(primary_df)
-  }
-
-  key1 <- paste0(primary_df$chr, ":", primary_df$pos_bp)
-  key2 <- paste0(secondary_df$chr, ":", secondary_df$pos_bp)
-  common_keys <- intersect(key1, key2)
-  if (length(common_keys) == 0) {
-    stop("两个表型之间没有共享的变异 (chr:pos)")
-  }
-
-  idx1 <- match(common_keys, key1)
-  idx2 <- match(common_keys, key2)
-
-  aligned <- primary_df[idx1, , drop = FALSE]
-  aligned$zscore_pheno1 <- as.numeric(aligned$Z)
-  aligned$zscore_pheno2 <- as.numeric(secondary_df$Z[idx2])
-  aligned$Z <- NULL
-
-  aligned <- aligned[!is.na(aligned$zscore_pheno1) & !is.na(aligned$zscore_pheno2), , drop = FALSE]
-
-  if (verbose) {
-    cat(sprintf("Dual trait alignment: kept %d shared variants\n", nrow(aligned)))
-  }
-
-  aligned
 }
 
 align_positions_with_info <- function(variant_ids, variant_info, fallback_positions = NULL) {
@@ -954,6 +900,17 @@ execute_pipeline <- function(opts) {
   auto_trait_names <- NULL
   should_plot <- exists("plot_manhattan")
 
+  if (is.null(opts$info) && !is.null(opts$gwas1)) {
+    info_df <- as.data.frame(py_build_info_from_gwas(opts$gwas1), stringsAsFactors = FALSE)
+    if (is.null(info_df) || nrow(info_df) == 0) {
+      stop("自动生成Info失败: gwas1无有效CHR/POS")
+    }
+    info_path <- tempfile(paste0("auto_info_", gsub("[^A-Za-z0-9_]+", "_", tools::file_path_sans_ext(basename(opts$gwas1))), "_"), fileext = ".csv")
+    readr::write_csv(info_df, info_path)
+    opts$info <- info_path
+    auto_temp_paths <- c(auto_temp_paths, info_path)
+  }
+
   if (!is.null(opts$panel) && is.null(opts$ref_plink)) {
     opts$ref_plink <- opts$panel
   }
@@ -1047,17 +1004,11 @@ execute_pipeline <- function(opts) {
   gwas_secondary <- NULL
 
   if (!is.null(opts$gwas1)) {
-    gwas1_df <- as.data.frame(py_load_gwas_table(opts$gwas1), stringsAsFactors = FALSE)
-    gwas_primary <- merge_gwas_with_info(info, gwas1_df)
-    if (is.null(gwas_primary) || nrow(gwas_primary) == 0) {
-      stop('变异信息与GWAS1在CHR+POS上没有交集')
-    }
+    gwas_primary <- merge_gwas_with_info(info, as.data.frame(py_load_gwas_table(opts$gwas1), stringsAsFactors = FALSE))
+    if (is.null(gwas_primary) || nrow(gwas_primary) == 0) stop('变异信息与GWAS1在CHR+POS上没有交集')
     if (!is.null(opts$gwas2)) {
-      gwas2_df <- as.data.frame(py_load_gwas_table(opts$gwas2), stringsAsFactors = FALSE)
-      gwas_secondary <- merge_gwas_with_info(info, gwas2_df)
-      if (is.null(gwas_secondary) || nrow(gwas_secondary) == 0) {
-        stop('变异信息与GWAS2在CHR+POS上没有交集')
-      }
+      gwas_secondary <- merge_gwas_with_info(info, as.data.frame(py_load_gwas_table(opts$gwas2), stringsAsFactors = FALSE))
+      if (is.null(gwas_secondary) || nrow(gwas_secondary) == 0) stop('变异信息与GWAS2在CHR+POS上没有交集')
     }
   } else if (!is.null(opts$multi_gwas) && !is.null(opts$zcols)) {
     mg <- py_load_multi_gwas_table(opts$multi_gwas, opts$zcols)
@@ -1077,7 +1028,7 @@ execute_pipeline <- function(opts) {
     stop('未提供 GWAS 输入。请使用 --gwas1/--gwas2 或 --multi_gwas 配合 --zcols')
   }
 
-  aligned_gwas <- align_dual_traits(gwas_primary, gwas_secondary, verbose = opts$verbose)
+  aligned_gwas <- py_align_dual_traits(gwas_primary, gwas_secondary)
   if (nrow(aligned_gwas) == 0) {
     stop('未能获得有效的GWAS记录，请检查输入文件是否与变异信息匹配')
   }
@@ -1133,7 +1084,7 @@ execute_pipeline <- function(opts) {
     variant_ids <- paste0(gwas_selected$chr, ':', gwas_selected$pos_bp)
     colnames(geno_matrix) <- variant_ids
   }
-  variant_positions <- align_positions_with_info(
+  variant_positions <- py_align_positions(
     variant_ids,
     info,
     fallback_positions = as.numeric(ali$positions)

@@ -43,7 +43,7 @@ Rscript run_pipeline.R --mode correl \
 ```
 
 ## 输入要求
-- Info CSV：`chr, pos_bp, rsid`
+- Info CSV：`chr, pos_bp, rsid`（未提供时会依据 `--gwas1` 自动生成）
 - GWAS：`CHR, POS, Z`（单表型或双表型；双表型时需两份文件或 `--multi_gwas --zcols`）
 - 基因型：`--geno_rds`、`--geno_csv`（需指定 `--geno_format`）、`--geno_plink`
 - `--ld_coord`：指定 LD block 坐标版本（`GRCh37` / `GRCh38` 或路径）
