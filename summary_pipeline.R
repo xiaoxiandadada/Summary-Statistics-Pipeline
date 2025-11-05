@@ -101,6 +101,26 @@ py_align_positions <- function(variant_ids, variant_info, fallback_positions = N
   reticulate::py_to_r(py_env$align_positions_with_info(variant_ids, info_py, fallback_positions))
 }
 
+merge_gwas_with_info <- function(info_df, gwas_df) {
+  if (is.null(gwas_df)) return(NULL)
+  df <- as.data.frame(gwas_df, stringsAsFactors = FALSE)
+  required <- c("CHR", "POS", "Z")
+  if (!all(required %in% names(df))) {
+    stop("GWAS 文件缺少 CHR/POS/Z 列")
+  }
+  df$CHR <- as.integer(df$CHR)
+  df$POS <- as.numeric(df$POS)
+  df$Z <- as.numeric(df$Z)
+  df <- df[!is.na(df$CHR) & !is.na(df$POS) & !is.na(df$Z), , drop = FALSE]
+  if (nrow(df) == 0) return(NULL)
+
+  merged <- merge(info_df, df, by.x = c("chr", "pos_bp"), by.y = c("CHR", "POS"), all = FALSE)
+  if (!"rsid" %in% names(merged) || all(is.na(merged$rsid))) {
+    merged$rsid <- paste0(merged$chr, ":", merged$pos_bp)
+  }
+  merged
+}
+
 load_gene_catalog <- function(coord, base_dir = '.') {
   genes <- py_load_gene_catalog(coord, base_dir)
   df <- as.data.frame(genes, stringsAsFactors = FALSE)

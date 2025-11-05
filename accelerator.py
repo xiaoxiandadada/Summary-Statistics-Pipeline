@@ -87,10 +87,6 @@ def ld_pruning(corr_matrix, threshold: float = 0.75):
             kept.append(i)
     return np.array(kept, dtype=np.int64)
 
-
-# %% MARK: Helpers for pandas-based preprocessing
-
-
 def _canon_chr(series):
     s = series.astype(str).str.upper().str.replace('^CHR', '', regex=True)
     s = s.replace({'X': '23', 'Y': '24', 'M': '25', 'MT': '25', 'MITO': '25'})
@@ -398,6 +394,107 @@ def load_variant_info(path: str):
     return out.reset_index(drop=True)
 
 
+def build_info_from_gwas(gwas_path: str):
+    df = load_gwas_table(gwas_path)
+    info = df[['CHR', 'POS']].drop_duplicates().sort_values(['CHR', 'POS'])
+    info = info.rename(columns={'CHR': 'chr', 'POS': 'pos_bp'})
+    info['rsid'] = info['chr'].astype('Int64').astype(str) + ':' + info['pos_bp'].astype('Int64').astype(str)
+    return info[['rsid', 'chr', 'pos_bp']]
+
+
+def align_dual_traits(primary_df, secondary_df=None):
+    import pandas as pd
+    primary = pd.DataFrame(primary_df).copy()
+    if primary.empty:
+        raise ValueError('primary GWAS data is empty')
+    required = {'chr', 'pos_bp', 'Z'}
+    if not required.issubset(primary.columns):
+        missing = required - set(primary.columns)
+        raise ValueError(f'primary GWAS missing columns: {missing}')
+
+    primary['chr'] = pd.to_numeric(primary['chr'], errors='coerce')
+    primary['pos_bp'] = pd.to_numeric(primary['pos_bp'], errors='coerce')
+    primary['Z'] = pd.to_numeric(primary['Z'], errors='coerce')
+    primary = primary.dropna(subset=['chr', 'pos_bp', 'Z'])
+
+    if secondary_df is None:
+        primary = primary.sort_values(['chr', 'pos_bp']).reset_index(drop=True)
+        primary['zscore_pheno1'] = primary['Z']
+        primary['zscore_pheno2'] = pd.NA
+        return primary[['rsid', 'chr', 'pos_bp', 'zscore_pheno1', 'zscore_pheno2']]
+
+    secondary = pd.DataFrame(secondary_df).copy()
+    if secondary.empty:
+        primary = primary.sort_values(['chr', 'pos_bp']).reset_index(drop=True)
+        primary['zscore_pheno1'] = primary['Z']
+        primary['zscore_pheno2'] = pd.NA
+        return primary[['rsid', 'chr', 'pos_bp', 'zscore_pheno1', 'zscore_pheno2']]
+
+    if not required.issubset(secondary.columns):
+        missing = required - set(secondary.columns)
+        raise ValueError(f'secondary GWAS missing columns: {missing}')
+
+    secondary['chr'] = pd.to_numeric(secondary['chr'], errors='coerce')
+    secondary['pos_bp'] = pd.to_numeric(secondary['pos_bp'], errors='coerce')
+    secondary['Z'] = pd.to_numeric(secondary['Z'], errors='coerce')
+    secondary = secondary.dropna(subset=['chr', 'pos_bp', 'Z'])
+
+    merged = primary.merge(
+        secondary[['chr', 'pos_bp', 'Z']],
+        on=['chr', 'pos_bp'],
+        suffixes=('_p', '_s'),
+        how='inner'
+    )
+    if merged.empty:
+        raise ValueError('No shared variants found between primary and secondary GWAS')
+
+    merged = merged.sort_values(['chr', 'pos_bp']).reset_index(drop=True)
+    merged['zscore_pheno1'] = merged['Z_p']
+    merged['zscore_pheno2'] = merged['Z_s']
+    cols = ['rsid', 'chr', 'pos_bp', 'zscore_pheno1', 'zscore_pheno2']
+    if 'rsid' not in merged.columns:
+        merged['rsid'] = merged['chr'].astype('Int64').astype(str) + ':' + merged['pos_bp'].astype('Int64').astype(str)
+    return merged[cols]
+
+
+def align_positions_with_info(variant_ids, variant_info, fallback_positions=None):
+    import numpy as np
+    info_df = pd.DataFrame(variant_info).copy()
+    if info_df.empty or 'chr' not in info_df or 'pos_bp' not in info_df:
+        if fallback_positions is None:
+            return np.full(len(variant_ids), np.nan)
+        return np.asarray(fallback_positions, dtype=float)
+
+    info_df['chr'] = pd.to_numeric(info_df['chr'], errors='coerce')
+    info_df['pos_bp'] = pd.to_numeric(info_df['pos_bp'], errors='coerce')
+    info_df = info_df.dropna(subset=['chr', 'pos_bp'])
+
+    chrpos_map = {
+        f"{int(row.chr)}:{int(row.pos_bp)}": float(row.pos_bp)
+        for row in info_df.itertuples()
+    }
+    rsid_map = {}
+    if 'rsid' in info_df.columns:
+        rsid_series = info_df['rsid'].astype(str)
+        rsid_map = {rsid: float(pos) for rsid, pos in zip(rsid_series, info_df['pos_bp']) if rsid and rsid != 'nan'}
+
+    result = np.full(len(variant_ids), np.nan)
+    for idx, vid in enumerate(variant_ids):
+        if not isinstance(vid, str):
+            continue
+        if vid in rsid_map:
+            result[idx] = rsid_map[vid]
+        elif vid in chrpos_map:
+            result[idx] = chrpos_map[vid]
+
+    if fallback_positions is not None:
+        fallback = np.asarray(fallback_positions, dtype=float)
+        mask = ~np.isfinite(result)
+        result[mask] = fallback[mask]
+
+    return result
+
+
 def _detect_traits(df: 'pd.DataFrame', trait_cols) -> list[str]:
     exclude = {'CHR', 'POS', 'CM', 'A1', 'A2', 'BP', 'N', 'SE', 'P', 'BETA'}
     numeric_cols = []
@@ -468,7 +565,23 @@ def load_gwas_table(gwas_file: str) -> 'pd.DataFrame':
     df['POS'] = _canon_pos(df['POS'])
     z_col = next((c for c in df.columns if c.upper() == 'Z'), None)
     if z_col is None:
-        raise ValueError('GWAS file must contain Z column')
+        candidates: list[str] = []
+        for col in df.columns:
+            col_upper = col.upper()
+            if col_upper in {'CHR', 'POS', 'BP', 'CM', 'ID'}:
+                continue
+            numeric = pd.to_numeric(df[col], errors='coerce')
+            if numeric.notna().any():
+                df[col] = numeric
+                candidates.append(col)
+        if candidates:
+            z_col = candidates[0]
+            warnings.warn(
+                f"Z列缺失，已默认使用数值列 '{z_col}' 作为Z-score (来源: {os.path.basename(gwas_file)})",
+                UserWarning,
+            )
+        else:
+            raise ValueError('GWAS file must contain at least one numeric column for Z scores')
     df['Z'] = pd.to_numeric(df[z_col], errors='coerce')
     df = df.dropna(subset=['CHR', 'POS', 'Z']).drop_duplicates(subset=['CHR', 'POS'])
     return df[['CHR', 'POS', 'Z']].reset_index(drop=True)

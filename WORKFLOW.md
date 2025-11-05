@@ -5,6 +5,8 @@
 run_pipeline.R
   └─ execute_pipeline(opts)
        ├─ py_auto_prepare_inputs()/merge_gwas_with_info()
+       │     └─ 若 GWAS 无 Z 列，默认使用第一列数值数据
+       │     └─ 缺少 Info 时通过 `build_info_from_gwas()` 自动生成
        ├─ align_dual_traits() → 输出齐整的 gwas_data
        ├─ load_genotype_plink()/load_genotype_rds()/load_genotype_csv()
        ├─ align_genotype_to_gwas()
