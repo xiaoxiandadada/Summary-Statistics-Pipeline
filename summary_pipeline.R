@@ -838,6 +838,11 @@ run_bivariate_analysis <- function(genotype_matrix, zscore_pheno1, zscore_pheno2
   Z1 <- Z1[keep_cols, , drop = FALSE]
   Z2 <- Z2[keep_cols, , drop = FALSE]
 
+  if (ncol(G) < 2 || qr(G)$rank < ncol(G)) {
+    if (verbose) message("跳过窗口: 基因型矩阵秩不足导致Sigma非正定")
+    return(NULL)
+  }
+
   effective_n <- n_samples
   geno_n <- nrow(G)
   if (!is.na(geno_n) && geno_n > 1 && geno_n != n_samples) {
