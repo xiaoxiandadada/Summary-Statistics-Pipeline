@@ -37,6 +37,8 @@ opt_list <- list(
               help = 'GWAS汇总统计文件1 (列: CHR, POS, Z)', metavar = 'FILE'),
   make_option(c('--gwas2'), type = 'character', default = NULL,
               help = 'GWAS汇总统计文件2 (可选; correl模式建议提供)', metavar = 'FILE'),
+  make_option(c('--sample_overlap'), type = 'character', default = NULL,
+              help = '可选: 样本重叠矩阵文件 (LAVA 格式，对称矩阵，表头/行名为表型ID)', metavar = 'FILE'),
   make_option(c('-o', '--outdir'), type = 'character', default = 'results',
               help = '输出目录', metavar = 'DIR'),
   make_option(c('-n', '--n'), type = 'integer', default = 20000,

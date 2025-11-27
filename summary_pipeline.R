@@ -262,6 +262,33 @@ parse_trait_option <- function(x) {
   trimws(unlist(strsplit(x, ',')))
 }
 
+load_sample_overlap_matrix <- function(path, pheno1, pheno2) {
+  if (is.null(path) || !nzchar(path)) return(NULL)
+  if (!file.exists(path)) stop(sprintf("样本重叠矩阵文件不存在: %s", path))
+  mat_df <- utils::read.table(path, header = TRUE, check.names = FALSE, stringsAsFactors = FALSE)
+  if (ncol(mat_df) < 2) stop("样本重叠矩阵格式不正确：至少需要2列")
+  # 如果第一列是行名，且与余下列名匹配，则取作行名
+  if (!is.null(mat_df[[1]]) && all(mat_df[[1]] %in% colnames(mat_df)[-1])) {
+    rownames(mat_df) <- mat_df[[1]]
+    mat_df <- mat_df[, -1, drop = FALSE]
+  } else if (is.null(rownames(mat_df))) {
+    rownames(mat_df) <- colnames(mat_df)
+  }
+  mat <- as.matrix(mat_df)
+  if (nrow(mat) != ncol(mat)) stop("样本重叠矩阵必须为方阵")
+  if (!all(rownames(mat) %in% colnames(mat)) || !all(colnames(mat) %in% rownames(mat))) {
+    stop("样本重叠矩阵行名和列名需一致，且为表型ID")
+  }
+  if (!isTRUE(all.equal(mat, t(mat), tolerance = 1e-6))) warning("样本重叠矩阵非严格对称，将使用 (mat + t(mat))/2")
+  mat <- (mat + t(mat)) / 2
+  diag(mat) <- 1
+  wanted <- unique(c(pheno1, pheno2))
+  if (!all(wanted %in% rownames(mat))) {
+    stop(sprintf("样本重叠矩阵缺少表型: %s", paste(setdiff(wanted, rownames(mat)), collapse = ", ")))
+  }
+  mat[wanted, wanted, drop = FALSE]
+}
+
 infer_gene_catalog_key <- function(ld_coord_arg, default = "GRCh37") {
   if (is.null(ld_coord_arg) || !nzchar(ld_coord_arg)) return(default)
   upper_val <- toupper(ld_coord_arg)
@@ -753,6 +780,8 @@ process_single_locus <- function(chr, info_file, gwas_data, genotype_data, param
           window_end = window$end,
           n_samples = lava_sample_n,
           prune_thresh = params$prune_threshold,
+          sample_overlap = params$sample_overlap,
+          univ_p_thresh = params$univ_p_thresh,
           verbose = verbose
         )
 
@@ -812,10 +841,159 @@ process_single_locus <- function(chr, info_file, gwas_data, genotype_data, param
   return(results)
 }
 
+univ_bivariate_rg_overlap <- function(X, Zscore, n = 20000, prune_thresh = 99,
+                                      sample_overlap = NULL, integral.p = NULL, bivariate.integral = NULL) {
+  if (is.null(integral.p)) integral.p <- get("integral.p", envir = asNamespace("LAVAKnock"))
+  if (is.null(bivariate.integral)) bivariate.integral <- get("bivariate.integral", envir = asNamespace("LAVAKnock"))
+
+  make_pd <- function(mat, eps = 1e-8) {
+    if (all(is.finite(mat))) {
+      ok <- tryCatch({ chol(mat); TRUE }, error = function(...) FALSE)
+      if (ok) return(mat)
+    }
+    max_diag <- max(diag(mat), na.rm = TRUE)
+    if (!is.finite(max_diag) || max_diag <= 0) max_diag <- 1
+    adj <- mat
+    diag(adj) <- diag(adj) + eps * max_diag
+    npd <- tryCatch(Matrix::nearPD(adj, corr = FALSE, keepDiag = FALSE)$mat, error = function(...) NULL)
+    if (is.null(npd)) return(NULL)
+    as.matrix(npd)
+  }
+
+  svd_window <- svd(X / sqrt(n - 1))
+  Q_window <- svd_window$v
+  lambda_window <- svd_window$d * svd_window$d
+
+  cum.perc_window <- cumsum(lambda_window / sum(lambda_window) * 100)
+  keep_window <- 1:min(which(cum.perc_window >= prune_thresh))
+  K_window <- length(keep_window)
+  Q_pruned_window <- Q_window[, keep_window, drop = FALSE]
+  lambda_pruned_window <- lambda_window[keep_window]
+
+  r_window <- Zscore / sqrt(Zscore^2 + n - 2) # 对连续表型: Z -> r
+  alpha_window <- Q_pruned_window %*% diag(1 / lambda_pruned_window) %*% t(Q_pruned_window) %*% r_window
+
+  delta_window <- diag(c(sqrt(lambda_pruned_window))) %*% t(Q_pruned_window) %*% alpha_window
+
+  R2_window <- diag(t(r_window) %*% alpha_window)
+  eta2_window <- (n - 1) / (n - K_window - 1) * (1 - R2_window) # residual variance
+  sigma2_window <- eta2_window / (n - 1)
+  h2_window <- 1 - eta2_window
+
+  sigma_mat <- diag(c(sigma2_window))
+  if (!is.null(sample_overlap) && nrow(sample_overlap) >= 2 && ncol(sample_overlap) >= 2) {
+    rho <- as.numeric(sample_overlap[1, 2])
+    if (is.finite(rho)) {
+      sigma_mat[1, 2] <- sigma_mat[2, 1] <- rho * sqrt(sigma2_window[1] * sigma2_window[2])
+    }
+  }
+  sigma_mat <- make_pd(sigma_mat)
+  if (is.null(sigma_mat)) return(list(p_univariate = NA, h2_window = NA, K_window = NA, cov = NA, rg = NA, bivar_p = NA))
+
+  T_univariate <- diag(t(delta_window) %*% delta_window) / sigma2_window / K_window
+  p_univariate <- pf(T_univariate, K_window, n - K_window - 1, lower.tail = FALSE)
+
+  omega_window <- t(delta_window) %*% delta_window / K_window - sigma_mat
+  omega_window <- make_pd(omega_window)
+  if (is.null(omega_window)) {
+    return(list(p_univariate = p_univariate, h2_window = h2_window, K_window = K_window, cov = NA, rg = NA, bivar_p = NA))
+  }
+  cov <- omega_window[1, 2]
+  rg <- omega_window[1, 2] / sqrt(omega_window[1, 1] * omega_window[2, 2])
+  if (any(is.na(rg) | h2_window < 0) || any(diag(omega_window) < 0)) {
+    rg <- NA
+    bivar_p <- NA
+  } else {
+    bivar_p <- signif(
+      integral.p(
+        bivariate.integral,
+        K = K_window,
+        omega = omega_window,
+        sigma = sigma_mat,
+        adap.thresh = c(1e-4, 1e-6)
+      ),
+      6
+    )
+  }
+  list(p_univariate = p_univariate, h2_window = h2_window, K_window = K_window,
+       cov = cov, rg = rg, bivar_p = bivar_p)
+}
+
+lavaknock_bivariate_local <- function(Zscore_pheno1_window, Zscore_pheno2_window, G_window,
+                                      chr, window_start, window_end,
+                                      n = 20000, prune_thresh = 99,
+                                      sample_overlap = NULL, univ_p_thresh = 0.1,
+                                      verbose = FALSE) {
+  G_window[G_window < 0 | G_window > 2] <- 0
+  MAF <- colMeans(G_window) / 2
+  MAC <- colSums(G_window)
+  s <- colMeans(G_window^2) - colMeans(G_window)^2
+  SNP.index <- which(MAF > 0 & MAC >= 25 & s != 0 & !is.na(MAF))
+  G_window <- G_window[, SNP.index, drop = FALSE]
+  if (ncol(G_window) < 2) return(NULL)
+
+  pos <- suppressWarnings(as.numeric(gsub("^.*\\:", "", colnames(G_window))))
+  ord <- order(pos)
+  G_window <- G_window[, ord, drop = FALSE]
+
+  G_window <- Matrix::Matrix(G_window, sparse = TRUE)
+  pos <- suppressWarnings(as.numeric(gsub("^.*\\:", "", colnames(G_window))))
+
+  AF <- Matrix::colMeans(G_window) / 2
+  X_window <- (G_window - matrix(2 * AF, nrow = n, ncol = length(AF), byrow = TRUE)) /
+    matrix(sqrt(2 * AF * (1 - AF)), nrow = n, ncol = length(AF), byrow = TRUE)
+
+  knock_cols <- setdiff(colnames(Zscore_pheno1_window), "org")
+  integral.p <- get("integral.p", envir = asNamespace("LAVAKnock"))
+  bivariate.integral <- get("bivariate.integral", envir = asNamespace("LAVAKnock"))
+
+  do_univ <- function(z1, z2) {
+    univ_bivariate_rg_overlap(
+      X = X_window,
+      Zscore = cbind(z1, z2),
+      n = n,
+      prune_thresh = prune_thresh,
+      sample_overlap = sample_overlap,
+      integral.p = integral.p,
+      bivariate.integral = bivariate.integral
+    )
+  }
+
+  res_org <- do_univ(Zscore_pheno1_window$org, Zscore_pheno2_window$org)
+  if (is.null(res_org)) return(NULL)
+  # 单变量过滤：任一表型未通过则跳过窗口
+  if (!is.null(univ_p_thresh) && any(is.finite(res_org$p_univariate))) {
+    if (any(res_org$p_univariate > univ_p_thresh, na.rm = TRUE)) {
+      if (verbose) message("窗口未通过单变量过滤，跳过")
+      return(NULL)
+    }
+  }
+
+  out <- list(
+    chr = chr,
+    window.start = window_start,
+    window.end = window_end,
+    rg.orginal = res_org$rg,
+    pval.orginal = res_org$bivar_p
+  )
+
+  for (k in seq_along(knock_cols)) {
+    res_k <- do_univ(
+      Zscore_pheno1_window[[knock_cols[k]]],
+      Zscore_pheno2_window[[knock_cols[k]]]
+    )
+    out[[paste0("rg.knockoff", k)]] <- res_k$rg
+    out[[paste0("pval.knockoff", k)]] <- res_k$bivar_p
+  }
+
+  as.data.frame(out, stringsAsFactors = FALSE)
+}
+
 #' 双变量局部遗传相关性分析
 run_bivariate_analysis <- function(genotype_matrix, zscore_pheno1, zscore_pheno2,
                                   chr, window_start, window_end,
                                   n_samples = 20000, prune_thresh = 99,
+                                  sample_overlap = NULL, univ_p_thresh = 0.1,
                                   verbose = FALSE) {
 
   G <- as.matrix(genotype_matrix)
@@ -856,7 +1034,7 @@ run_bivariate_analysis <- function(genotype_matrix, zscore_pheno1, zscore_pheno2
   }
 
   res <- tryCatch(
-    LAVAKnock::LAVAKnock_bivariate(
+    lavaknock_bivariate_local(
       Zscore_pheno1_window = Z1,
       Zscore_pheno2_window = Z2,
       G_window = G,
@@ -864,10 +1042,13 @@ run_bivariate_analysis <- function(genotype_matrix, zscore_pheno1, zscore_pheno2
       window_start = window_start,
       window_end = window_end,
       n = effective_n,
-      prune.thresh = prune_thresh
+      prune_thresh = prune_thresh,
+      sample_overlap = sample_overlap,
+      univ_p_thresh = univ_p_thresh,
+      verbose = verbose
     ),
     error = function(e) {
-      if (verbose) message("LAVAKnock_bivariate失败: ", e$message)
+      if (verbose) message("lavaknock_bivariate_local失败: ", e$message)
       NULL
     }
   )
@@ -1003,6 +1184,11 @@ execute_pipeline <- function(opts) {
     }
   }
 
+  sample_overlap_mat <- NULL
+  if (!is.null(opts$sample_overlap) && nzchar(opts$sample_overlap)) {
+    sample_overlap_mat <- load_sample_overlap_matrix(opts$sample_overlap, opts$pheno1_name, opts$pheno2_name)
+  }
+
   dir.create(opts$outdir, showWarnings = FALSE, recursive = TRUE)
 
   if (is.null(opts$ld_coord) || !nzchar(opts$ld_coord)) {
@@ -1029,10 +1215,30 @@ execute_pipeline <- function(opts) {
   gwas_secondary <- NULL
 
   if (!is.null(opts$gwas1)) {
-    gwas_primary <- merge_gwas_with_info(info, as.data.frame(py_load_gwas_table(opts$gwas1), stringsAsFactors = FALSE))
+    if (!is.null(opts$panel)) {
+      try_align <- try(as.data.frame(py_env$align_sumstats_with_panel(opts$gwas1, opts$panel), stringsAsFactors = FALSE), silent = TRUE)
+      if (!inherits(try_align, "try-error")) {
+        g1_raw <- try_align
+      } else {
+        g1_raw <- as.data.frame(py_load_gwas_table(opts$gwas1), stringsAsFactors = FALSE)
+      }
+    } else {
+      g1_raw <- as.data.frame(py_load_gwas_table(opts$gwas1), stringsAsFactors = FALSE)
+    }
+    gwas_primary <- merge_gwas_with_info(info, g1_raw)
     if (is.null(gwas_primary) || nrow(gwas_primary) == 0) stop('变异信息与GWAS1在CHR+POS上没有交集')
     if (!is.null(opts$gwas2)) {
-      gwas_secondary <- merge_gwas_with_info(info, as.data.frame(py_load_gwas_table(opts$gwas2), stringsAsFactors = FALSE))
+      if (!is.null(opts$panel)) {
+        try_align2 <- try(as.data.frame(py_env$align_sumstats_with_panel(opts$gwas2, opts$panel), stringsAsFactors = FALSE), silent = TRUE)
+        if (!inherits(try_align2, "try-error")) {
+          g2_raw <- try_align2
+        } else {
+          g2_raw <- as.data.frame(py_load_gwas_table(opts$gwas2), stringsAsFactors = FALSE)
+        }
+      } else {
+        g2_raw <- as.data.frame(py_load_gwas_table(opts$gwas2), stringsAsFactors = FALSE)
+      }
+      gwas_secondary <- merge_gwas_with_info(info, g2_raw)
       if (is.null(gwas_secondary) || nrow(gwas_secondary) == 0) stop('变异信息与GWAS2在CHR+POS上没有交集')
     }
   } else if (!is.null(opts$multi_gwas) && !is.null(opts$zcols)) {
@@ -1335,13 +1541,15 @@ execute_pipeline <- function(opts) {
       data_dir = dirname(opts$info),
       output_dir = opts$outdir,
       sample_size = opts$n,
-      window_size = 5000000L,
-      window_step = 5000000L,
+      window_size = 100000L,
+      window_step = 100000L,
       knockoffs = opts$knockoffs,
       fdr = opts$fdr,
       ld_threshold = 0.75,
       prune_threshold = 99,
+      univ_p_thresh = 0.1,
       run_mode = 'ghostknockoff_only',
+      sample_overlap = sample_overlap_mat,
       ld_coord = opts$ld_coord,
       threads = opts$threads
     )

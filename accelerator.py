@@ -602,6 +602,113 @@ def load_multi_gwas_table(multi_file: str, zcols: str) -> dict[str, object]:
     return {'data': df, 'zcols': user_cols}
 
 
+def align_sumstats_with_panel(
+    sumstats_path: str,
+    panel_prefix: str,
+    chr_col: str | None = None,
+    pos_col: str | None = None,
+    a1_col: str = 'A1',
+    a2_col: str = 'A2',
+    z_col: str | None = None,
+) -> pd.DataFrame:
+    """
+    对包含等位基的 sumstats 做等位方向校验并对齐参考 panel (PLINK bim)。
+    不兼容等位基的位点会被丢弃；若 A1/A2 互换则翻转 Z。
+    返回列: CHR, POS, Z, SNP。
+    """
+    df = pd.read_csv(sumstats_path, sep=None, engine='python')
+    if chr_col is None:
+        for cand in ['CHR', 'chrom', 'chromosome']:
+            if cand in df.columns:
+                chr_col = cand
+                break
+    if pos_col is None:
+        for cand in ['POS', 'BP', 'bp', 'position']:
+            if cand in df.columns:
+                pos_col = cand
+                break
+    if chr_col is None or pos_col is None:
+        raise ValueError('CHR / POS column missing in sumstats')
+    if a1_col not in df.columns or a2_col not in df.columns:
+        raise ValueError('A1/A2 column missing in sumstats')
+
+    # 计算/选择 Z
+    z_series = None
+    if z_col and z_col in df.columns:
+        z_series = df[z_col]
+    else:
+        if 'Z' in df.columns:
+            z_series = df['Z']
+        elif {'LogOR', 'StdErrLogOR'}.issubset(df.columns):
+            z_series = df['LogOR'] / df['StdErrLogOR']
+        elif {'BETA', 'SE'}.issubset(df.columns):
+            z_series = df['BETA'] / df['SE']
+        else:
+            # 退化：首个数值列
+            candidates = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if not candidates:
+                raise ValueError('No Z or numeric column available to compute Z')
+            z_series = df[candidates[0]]
+            warnings.warn(
+                f"Z列缺失，已默认使用数值列 '{candidates[0]}' 作为Z-score (来源: {sumstats_path})",
+                UserWarning,
+            )
+
+    # 读 panel bim
+    bim_path = panel_prefix + '.bim'
+    if not os.path.exists(bim_path):
+        raise FileNotFoundError(f'Panel bim not found: {bim_path}')
+    bim = pd.read_csv(
+        bim_path,
+        sep=r'\\s+',
+        header=None,
+        names=['CHR', 'SNP', 'CM', 'BP', 'A1', 'A2'],
+        dtype={'CHR': str},
+    )
+    bim['CHR'] = bim['CHR'].astype(str)
+    bim['BP'] = pd.to_numeric(bim['BP'], errors='coerce')
+
+    ss = df.copy()
+    ss['CHR'] = ss[chr_col].astype(str)
+    ss['POS'] = pd.to_numeric(ss[pos_col], errors='coerce')
+    ss['A1'] = ss[a1_col].str.lower()
+    ss['A2'] = ss[a2_col].str.lower()
+    ss['Z'] = pd.to_numeric(z_series, errors='coerce')
+    ss = ss.dropna(subset=['CHR', 'POS', 'A1', 'A2', 'Z'])
+
+    merged = bim.merge(
+        ss,
+        left_on=['CHR', 'BP'],
+        right_on=['CHR', 'POS'],
+        how='inner',
+        suffixes=('_bim', '_ss'),
+    )
+    if merged.empty:
+        raise ValueError('No overlap between panel bim and sumstats (CHR+POS)')
+
+    def orient(row):
+        a1_ref = row['A1_bim'].lower()
+        a2_ref = row['A2_bim'].lower()
+        a1 = row['A1']
+        a2 = row['A2']
+        z = row['Z']
+        if a1 == a1_ref and a2 == a2_ref:
+            return z
+        if a1 == a2_ref and a2 == a1_ref:
+            return -z
+        return None
+
+    merged['Z_oriented'] = merged.apply(orient, axis=1)
+    merged = merged.dropna(subset=['Z_oriented'])
+    if merged.empty:
+        raise ValueError('All overlapping variants failed allele orientation check')
+
+    out = merged[['CHR', 'BP', 'Z_oriented', 'SNP']].rename(columns={'BP': 'POS', 'Z_oriented': 'Z'})
+    out['CHR'] = pd.to_numeric(out['CHR'], errors='coerce')
+    out = out.dropna(subset=['CHR', 'POS', 'Z']).reset_index(drop=True)
+    return out[['CHR', 'POS', 'Z', 'SNP']]
+
+
 def load_gene_catalog(coord_version: str, base_dir: str = '.'):
     candidate = coord_version.strip()
     if os.path.isfile(candidate):

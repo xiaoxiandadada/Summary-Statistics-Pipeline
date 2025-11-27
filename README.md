@@ -38,6 +38,7 @@ Rscript run_pipeline.R --mode correl \
   --gwas2 data/demo/gwas_trait2.tsv \
   --panel data/demo/demo_chr10 \
   --ld_coord GRCh37 \
+  --sample_overlap LAVA-main/vignettes/data/sample.overlap.txt \
   --fdr 0.1 --knockoffs 5 \
   -o results/correl_demo -v
 ```
@@ -45,6 +46,7 @@ Rscript run_pipeline.R --mode correl \
 ## 输入要求
 - Info CSV：`chr, pos_bp, rsid`（未提供时会依据 `--gwas1` 自动生成）
 - GWAS：`CHR, POS, Z`（若缺少 `Z` 列，将默认取第一个数值列作为 Z-score；双表型时需两份文件或 `--multi_gwas --zcols`）
+- 样本重叠（可选）：`--sample_overlap` 提供 LAVA 格式对称矩阵（行/列为表型 ID，对角=1）
 - 基因型：`--geno_rds`、`--geno_csv`（需指定 `--geno_format`）、`--geno_plink`
 - `--ld_coord`：指定 LD block 坐标版本（`GRCh37` / `GRCh38` 或路径）
 
