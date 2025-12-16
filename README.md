@@ -33,19 +33,18 @@ Rscript run_pipeline.R --mode select \
 ```bash
 RETICULATE_PYTHON=.venv/bin/python \
 Rscript run_pipeline.R --mode correl \
-  --info data/demo/demo_info.csv \
-  --gwas1 data/demo/gwas_trait1.tsv \
-  --gwas2 data/demo/gwas_trait2.tsv \
-  --panel data/demo/demo_chr10 \
+  --gwas1 data/lava_demo/asthma.sumstats.txt \
+  --gwas2 data/lava_demo/bmi.sumstats.txt \
+  --panel data/lava_demo/g1000_test \
   --ld_coord GRCh37 \
   --sample_overlap LAVA-main/vignettes/data/sample.overlap.txt \
   --fdr 0.1 --knockoffs 5 \
-  -o results/correl_demo -v
+  -o results/correl_asthma_bmi -v
 ```
 
 ## 输入要求
-- Info CSV：`chr, pos_bp, rsid`（未提供时会依据 `--gwas1` 自动生成）
-- GWAS：`CHR, POS, Z`（若缺少 `Z` 列，将默认取第一个数值列作为 Z-score；双表型时需两份文件或 `--multi_gwas --zcols`）
+- Info 可选：`chr, pos_bp, rsid`（未提供时会依据 `--gwas1` 自动构建，文件名前缀取 gwas1 基名）
+- GWAS：需含 `CHR, POS`；优选含 `A1, A2` 以对齐等位方向。若缺 `Z` 列，将默认取第一个数值列作为 Z-score；双表型需两份文件或 `--multi_gwas --zcols`
 - 样本重叠（可选）：`--sample_overlap` 提供 LAVA 格式对称矩阵（行/列为表型 ID，对角=1）
 - 基因型：`--geno_rds`、`--geno_csv`（需指定 `--geno_format`）、`--geno_plink`
 - `--ld_coord`：指定 LD block 坐标版本（`GRCh37` / `GRCh38` 或路径）
@@ -76,4 +75,6 @@ results/               # 最新分析结果
 ## 注意事项
 - 请设置 `RETICULATE_PYTHON` 指向包含 `numpy/numba` 的解释器。
 - 双表型模式会对齐共享位点，不匹配的 SNP 将被丢弃。
+- 等位基对齐：若 GWAS 含 A1/A2 且提供 panel，会对齐参考 panel，互换等位基时翻转 Z；缺 A1/A2 时仅按位置对齐，可能有符号风险。
+- 样本重叠：`--sample_overlap` 用 LDSC cross-trait 结果构建。
 - `--threads` 控制 Python 分块并行度，默认使用全部核心。

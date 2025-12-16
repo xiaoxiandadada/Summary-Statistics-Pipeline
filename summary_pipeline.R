@@ -1167,8 +1167,26 @@ execute_pipeline <- function(opts) {
     stop('必须提供 --mode')
   }
 
+  # 若未提供 info，但有 GWAS1，则从 GWAS1 构建 info（使用 CHR/POS，rsid 为 SNP 或 chr:pos）
+  auto_info_temp <- FALSE
+  if (is.null(opts$info) && !is.null(opts$gwas1)) {
+    g_tmp <- as.data.frame(py_load_gwas_table(opts$gwas1), stringsAsFactors = FALSE)
+    if (!all(c("CHR", "POS") %in% names(g_tmp))) stop('未提供 --info 且 GWAS1 缺少 CHR/POS，无法自动构建 info')
+    rsid_col <- if ("SNP" %in% names(g_tmp)) g_tmp$SNP else paste0(g_tmp$CHR, ":", g_tmp$POS)
+    info_tmp <- data.frame(chr = as.integer(g_tmp$CHR), pos_bp = as.numeric(g_tmp$POS), rsid = rsid_col, stringsAsFactors = FALSE)
+    info_tmp <- info_tmp[!is.na(info_tmp$chr) & !is.na(info_tmp$pos_bp), , drop = FALSE]
+    info_base <- gsub('[^A-Za-z0-9_]+', '_', tools::file_path_sans_ext(basename(opts$gwas1)))
+    info_path <- file.path(tempdir(), paste0('info_', info_base, '.csv'))
+    readr::write_csv(info_tmp, info_path)
+    opts$info <- info_path
+    auto_info_temp <- TRUE
+    if (is.null(opts$info_label) || !nzchar(opts$info_label)) {
+      opts$info_label <- info_base
+    }
+  }
+
   if (is.null(opts$info)) {
-    stop('必须提供 --info 或同时提供 --zscore 与 --panel/--ref_plink')
+    stop('必须提供 --info 或可自动从 gwas1 构建的 info')
   }
 
   if (is.null(opts$info_label) || !nzchar(opts$info_label)) {
